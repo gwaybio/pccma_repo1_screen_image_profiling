@@ -23,7 +23,7 @@ __pycache__/
 */*/data/
 
 # Ignore per-plate papermill-executed notebooks (e.g. one per plate from
-# 2.single_cell_qc.ipynb) - these are generated copies, not source
+# 1.single_cell_qc.ipynb) - these are generated copies, not source
 */*/executed_notebooks/
 
 # Ignore log files
@@ -31,3 +31,10 @@ __pycache__/
 
 # Ignore macOS Finder metadata
 .DS_Store
+
+# uv environment
+.venv/
+
+# Local copies of the final bulk profiles (large data files; READMEs and small tables are tracked)
+final_bulk_profiles/CHP-134/
+final_bulk_profiles/SK-N-AS/

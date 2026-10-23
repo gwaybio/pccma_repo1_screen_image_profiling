@@ -1,16 +1,15 @@
-"""Helpers for processing pooled bulk (well-level) profiles in the style of the JUMP profiling recipe.
+"""Helpers for processing pooled bulk (well-level) profiles.
 
-The recipe (https://github.com/broadinstitute/jump-profiling-recipe) processes the compound screens as
+Order: correct, then normalize, then (bulk only) rank-transform, then select features.
 
-    pool wells -> drop NaN/inf features -> per-plate control stats -> variant filter ->
-    MAD normalize (per plate) -> rank inverse normal transform -> pooled feature selection
+    pool wells -> drop NaN/inf features -> align the two DMSO columns of every plate (E3a) ->
+    match DMSO columns to the interior compound wells per layout (E3) -> variant filter -> provisional plate scale ->
+    cell-count slope + shared position map with one amplitude per layout -> subtract effects ->
+    normalize each plate on its corrected DMSO wells -> rank inverse normal transform -> pooled feature selection
 
-We add one step the recipe doesn't have, between dropping non-finite features and the variant filter: a
-correction for a plate-wide, left-to-right gradient found in both screens (see `correct_column_gradient`).
-
-These helpers implement the steps that pycytominer does not provide (pooling, dropping non-finite
-features, the per-plate variant filter, the position correction) and thin wrappers that apply pycytominer's
-`normalize` and `feature_select` with the settings used here. Nothing in this module is specific to one screen.
+Corrections (E3a, E3, the cell-count and position effects) are constants per well, so the same constants apply to a
+well's median and to each single cell in it (see `single_cell_utils`). Normalization is a separate, later step.
+pycytominer provides the inverse normal transform and feature selection; everything else is here.
 """
 
 import pathlib
@@ -20,12 +19,12 @@ from typing import Iterable, Sequence
 import numpy as np
 import pandas as pd
 from pycytominer import feature_select, normalize
+from pycytominer.operations.transform import RobustMAD
 from scipy.stats import median_abs_deviation
 
 PLATE_COLUMN = "Metadata_Plate"
 WELL_COLUMN = "Metadata_Well"
 BATCH_ID_COLUMN = "Metadata_Batch_Id"
-N_PLATE_COLUMNS = 24  # both screens use 384-well (16 x 24) plates
 
 
 def pool_plate_profiles(
@@ -94,12 +93,12 @@ def drop_wells(profiles: pd.DataFrame, query: str) -> tuple[pd.DataFrame, int]:
 
 
 # ---- position correction ----
-# Every plate has the same left-to-right gradient: DMSO controls differ between plate columns 2 and 24 (where
-# they sit), and compound wells drift smoothly between the two across the columns in between. The gradient shows
-# up in the controls, which have no compound at all, so it looks like a plate-wide technical effect rather than
-# biology. These functions estimate that gradient from the compound wells (so it doesn't just fit noise from the
-# ~30 controls per plate) and subtract it from every well before the variant filter and MAD normalization, so
-# those steps see a plate baseline that isn't stretched by the two control columns sitting at opposite ends of it.
+# The plates share a plate-position pattern (a row effect and a column effect per feature) that is seen in the DMSO
+# controls, which contain no compound, so it is a technical effect, not biology. It is estimated once for the screen
+# from the replicate-averaged compound wells of all layouts (so it does not just fit noise from the ~30 controls per
+# plate), and each layout gets its own amplitude of that shared map. DMSO wells (columns 2 and 24) receive the row
+# part of the map. The cell-count effect is estimated alongside. Both are constants per well and feature, and are
+# subtracted (in original units) after the variant filter and before the final normalization; see `estimate_effects`.
 
 
 def split_well(wells: pd.Series) -> pd.DataFrame:
@@ -113,91 +112,34 @@ def extract_compound_id(batch_ids: pd.Series, pattern: str = r"^(BRD-[A-Za-z]\d+
     return batch_ids.str.extract(pattern)[0]
 
 
-def platemap_groups(
-    profiles: pd.DataFrame, plate_column: str, compound_column: str, min_jaccard: float = 0.9
+def layouts_from_platemaps(
+    barcode_platemap_csv: pathlib.Path, platemap_dir: pathlib.Path, plate_column: str = PLATE_COLUMN
 ) -> pd.Series:
-    """Label each well with its plate map: the group of plates that carry (nearly) the same compounds.
+    """The layout of every plate, from the screen's barcode-to-platemap file and the platemap files themselves.
 
-    Plates are compared by the set of compounds they hold (``compound_column``, missing for control and empty
-    wells); plates whose sets overlap by at least ``min_jaccard`` (intersection over union) are joined, and the
-    connected groups are the plate maps. A plate with no compounds forms a group of its own. Groups are named
-    ``platemap_01``, ``platemap_02``, ... in order of first appearance.
+    ``barcode_platemap_csv`` has one row per plate (plate barcode, platemap file name). Two plates have the same
+    layout when their platemap files assign the same compound (batch ID) to the same wells, so layouts are read from
+    the platemaps' contents, not inferred from the profiles. Plate names have spaces replaced by underscores, as in
+    `pool_plate_profiles`. Returns a Series indexed by plate with labels ``layout_01``, ``layout_02``, ...
     """
-    sets = profiles.loc[profiles[compound_column].notna()].groupby(plate_column)[compound_column].agg(frozenset)
-    plates = list(pd.unique(profiles[plate_column]))
-    parent = {plate: plate for plate in plates}
-
-    def find(plate):
-        while parent[plate] != plate:
-            parent[plate] = parent[parent[plate]]
-            plate = parent[plate]
-        return plate
-
-    held = [plate for plate in plates if plate in sets.index]
-    for i, first in enumerate(held):
-        for second in held[i + 1 :]:
-            union = len(sets[first] | sets[second])
-            if union and len(sets[first] & sets[second]) / union >= min_jaccard:
-                parent[find(second)] = find(first)
-    roots = list(dict.fromkeys(find(plate) for plate in plates))
-    names = {root: f"platemap_{i + 1:02d}" for i, root in enumerate(roots)}
-    return profiles[plate_column].map({plate: names[find(plate)] for plate in plates})
-
-
-def column_curve(
-    profiles: pd.DataFrame,
-    features: Sequence[str],
-    compound_mask: np.ndarray,
-    group: np.ndarray,
-    well_column: str = WELL_COLUMN,
-    n_columns: int = N_PLATE_COLUMNS,
-) -> pd.DataFrame:
-    """Each feature's plate-column gradient: for every column, the median across plate-map groups of that
-    column's mean value among the compound wells of that group (a table of columns 1..``n_columns`` x features).
-
-    Using the median across groups, rather than pooling every compound well together, keeps one unusually
-    represented layout from dominating the curve. Columns with no compound wells (here, the two control columns)
-    reuse the nearest compound column's value, since the curve can't be estimated there directly. The curve is
-    centered so its average over columns is 0: it describes the gradient's shape, not its overall level.
-    """
-    features = list(features)
-    col = split_well(profiles[well_column])["well_column"].to_numpy()
-    index = pd.MultiIndex.from_arrays([group[compound_mask], col[compound_mask]], names=["group", "col"])
-    group_column_means = (
-        pd.DataFrame(profiles.loc[compound_mask, features].to_numpy(dtype=float), index=index, columns=features)
-        .groupby(level=["group", "col"])
-        .mean()
-    )
-    curve = group_column_means.groupby(level="col").median()
-    curve = curve.reindex(range(1, n_columns + 1)).ffill().bfill()
-    return curve - curve.mean(axis=0)
-
-
-def correct_column_gradient(
-    profiles: pd.DataFrame,
-    features: Sequence[str],
-    plate_column: str = PLATE_COLUMN,
-    well_column: str = WELL_COLUMN,
-    batch_id_column: str = BATCH_ID_COLUMN,
-    min_jaccard: float = 0.9,
-) -> pd.DataFrame:
-    """Subtract each feature's plate-column gradient (see `column_curve`) from every well, controls included.
-
-    The gradient is estimated once per plate-map group (plates sharing the same compounds; see `platemap_groups`)
-    from that group's compound wells, then applied to every well at that column on every plate, in every group.
-    """
-    features = list(features)
-    compound_id = extract_compound_id(profiles[batch_id_column])
-    compound_mask = compound_id.notna().to_numpy()
-    group = platemap_groups(
-        profiles.assign(**{"_position_correction_cid": compound_id}), plate_column, "_position_correction_cid", min_jaccard
-    ).to_numpy()
-
-    curve = column_curve(profiles, features, compound_mask, group, well_column)
-    col = split_well(profiles[well_column])["well_column"].to_numpy()
-    corrected = profiles.copy()
-    corrected[features] = profiles[features].to_numpy(dtype=float) - curve.reindex(col).to_numpy()
-    return corrected
+    table = pd.read_csv(barcode_platemap_csv)
+    plates = table.iloc[:, 0].astype(str).str.replace(" ", "_")
+    files = table.iloc[:, 1].astype(str)
+    signature = {}
+    for name in files.unique():
+        pm = pd.read_csv(pathlib.Path(platemap_dir) / name)
+        well = next(c for c in pm.columns if "well" in c.lower())
+        batch = next(c for c in pm.columns if "batch" in c.lower())
+        pm = pm.dropna(subset=[batch])
+        signature[name] = tuple(sorted(zip(pm[well].astype(str), pm[batch].astype(str))))
+    labels = {}
+    out = {}
+    for plate, name in zip(plates, files):
+        sig = signature[name]
+        if sig not in labels:
+            labels[sig] = f"layout_{len(labels) + 1:02d}"
+        out[plate] = labels[sig]
+    return pd.Series(out, name="layout")
 
 
 def plate_control_stats(
@@ -243,30 +185,6 @@ def variant_features(stats: dict[str, pd.DataFrame], min_abs_coef_var: float = 1
     return keep.index[keep].tolist(), keep.index[~keep].tolist()
 
 
-def normalize_by_plate(
-    profiles: pd.DataFrame,
-    features: Sequence[str],
-    control_query: str,
-    plate_column: str = PLATE_COLUMN,
-) -> pd.DataFrame:
-    """MAD-normalize every plate on its own control wells with pycytominer (median and MAD from that plate's controls)."""
-    features = list(features)
-    meta_features = split_feature_columns(profiles, features)
-
-    normalized = []
-    for _, plate_profiles in profiles.groupby(plate_column, sort=False):
-        normalized.append(
-            normalize(
-                profiles=plate_profiles.reset_index(drop=True),
-                features=features,
-                meta_features=meta_features,
-                samples=control_query,
-                method="mad_robustize",
-            )
-        )
-    return pd.concat(normalized, ignore_index=True)
-
-
 def inverse_normal_transform(profiles: pd.DataFrame, features: Sequence[str], random_state: int = 0) -> pd.DataFrame:
     """Rank-based inverse normal transform of every feature over all wells, with pycytominer's quantile method.
 
@@ -307,30 +225,334 @@ def select_features(
     )
 
 
-def spherize(
-    profiles: pd.DataFrame,
-    control_query: str,
-    epsilon: float = 1e-6,
-    method: str = "ZCA-cor",
-    freq_cut: float = 0.05,
-    unique_cut: float = 0.01,
-) -> pd.DataFrame:
-    """Whiten the pooled profiles with a transform fitted on the pooled control wells (the sphering step used so far).
+# ---------------------------------------------------------------------------------------------------------------
+# Corrections and normalization
+#
+# A *correction* removes one specific, named artifact. Every correction is a constant added to a well's values (or a
+# monotone map of them), so it can be applied identically to a well's median and to each single cell of that well,
+# in the profiles' original units. *Normalization* (centering and scaling each plate on its DMSO wells) is not a
+# correction; it always comes after the corrections, with statistics taken from the corrected DMSO wells.
+# ---------------------------------------------------------------------------------------------------------------
 
-    Features with too little variation among the controls are removed first, since they cannot be whitened.
+PLATE_ROWS = 16
+
+
+def _quantile_match_1d(values: np.ndarray, baseline_sorted: np.ndarray) -> np.ndarray:
+    """Map ``values`` onto the empirical distribution ``baseline_sorted``, keeping their own rank order."""
+    n = len(values)
+    order = np.argsort(values)
+    ranks = np.empty(n, dtype=float)
+    ranks[order] = np.arange(n)
+    percentile = (ranks + 0.5) / n
+    baseline_percentile = (np.arange(len(baseline_sorted)) + 0.5) / len(baseline_sorted)
+    return np.interp(percentile, baseline_percentile, baseline_sorted)
+
+
+def align_control_columns(
+    profiles: pd.DataFrame,
+    features: Sequence[str],
+    control_query: str,
+    plate_column: str = PLATE_COLUMN,
+    well_column: str = WELL_COLUMN,
+    columns: Sequence[int] = (2, 24),
+    min_wells: int = 5,
+) -> pd.DataFrame:
+    """E3a. Within every plate, make the control (DMSO) wells of the two control columns follow the same distribution.
+
+    Both control columns hold the same substance, so within a plate they should be interchangeable, yet each plate's
+    column 2 differs from its column 24 by a stable, plate-specific offset (it flips sign between plates, so no shared
+    correction can remove it). For each plate and feature the control wells of each column are mapped, rank-preserving,
+    onto the pooled distribution of that plate's control wells in both columns. A plate with fewer than ``min_wells``
+    control wells in either column is left unchanged.
     """
-    varying = feature_select(
-        profiles=profiles,
-        operation="frequency_threshold",
-        freq_cut=freq_cut,
-        unique_cut=unique_cut,
-        samples=control_query,
-    )
-    return normalize(
-        profiles=varying,
-        method="spherize",
-        samples=control_query,
-        spherize_center=True,
-        spherize_method=method,
-        spherize_epsilon=epsilon,
-    )
+    features = list(features)
+    col = split_well(profiles[well_column])["well_column"].to_numpy()
+    is_control = control_mask(profiles, control_query)
+    X = profiles[features].to_numpy(dtype=float).copy()
+    for _, idx in pd.Series(np.arange(len(profiles))).groupby(profiles[plate_column].to_numpy()).indices.items():
+        groups = [idx[is_control[idx] & (col[idx] == c)] for c in columns]
+        if any(len(g) < min_wells for g in groups):
+            continue
+        pooled = np.vstack([X[g] for g in groups])
+        pooled_sorted = np.sort(pooled, axis=0)
+        for g in groups:
+            for j in range(X.shape[1]):
+                X[g, j] = _quantile_match_1d(X[g, j], pooled_sorted[:, j])
+    out = profiles.copy()
+    out[features] = X
+    return out
+
+
+def match_outer_columns(
+    profiles: pd.DataFrame,
+    features: Sequence[str],
+    plate_column: str = PLATE_COLUMN,
+    well_column: str = WELL_COLUMN,
+    batch_id_column: str = BATCH_ID_COLUMN,
+    layout: Sequence | None = None,
+    interior_columns: Iterable[int] = range(3, 23),
+    outer_columns: Iterable[int] = (1, 2, 23, 24),
+    min_interior_wells: int = 20,
+    min_outer_wells: int = 5,
+) -> pd.DataFrame:
+    """E3. Map every outer plate column (the control columns) onto the distribution of the interior compound wells.
+
+    For each layout (``layout``: one label per row, see `layouts_from_platemaps`) and each feature, the interior
+    columns' compound wells define a baseline distribution. Every well in an outer column of that group is then
+    replaced by the baseline value at the same percentile among that column's wells (rank-preserving), controls
+    included. A group with fewer than ``min_interior_wells`` interior compound wells, or an outer column with fewer than
+    ``min_outer_wells`` wells, is left unchanged.
+    """
+    features = list(features)
+    if layout is None:
+        raise ValueError("layout labels are required (see layouts_from_platemaps)")
+    compound_mask = extract_compound_id(profiles[batch_id_column]).notna().to_numpy()
+    group = np.asarray(layout)
+    col = split_well(profiles[well_column])["well_column"].to_numpy()
+    X = profiles[features].to_numpy(dtype=float).copy()
+    interior = np.isin(col, list(interior_columns))
+    for g in pd.unique(group):
+        in_group = group == g
+        base_rows = in_group & compound_mask & interior
+        if base_rows.sum() < min_interior_wells:
+            continue
+        baseline_sorted = np.sort(X[base_rows], axis=0)
+        for c in outer_columns:
+            rows = in_group & (col == c)
+            if rows.sum() < min_outer_wells:
+                continue
+            for j in range(X.shape[1]):
+                X[rows, j] = _quantile_match_1d(X[rows, j], baseline_sorted[:, j])
+    out = profiles.copy()
+    out[features] = X
+    return out
+
+
+def _backfit_median(P: np.ndarray, r: np.ndarray, c: np.ndarray, n_rows: int, n_cols: int, n_iter: int):
+    """Additive row + column level vectors per feature by backfitting, each level the MEDIAN of its residuals."""
+    resid = P - np.median(P, axis=0)
+    row_level = np.zeros((n_rows, P.shape[1]))
+    col_level = np.zeros((n_cols, P.shape[1]))
+    for _ in range(n_iter):
+        res = resid - col_level[c]
+        for k in range(n_rows):
+            m = r == k
+            if m.any():
+                row_level[k] = np.median(res[m], axis=0)
+        res = resid - row_level[r]
+        for k in range(n_cols):
+            m = c == k
+            if m.any():
+                col_level[k] = np.median(res[m], axis=0)
+    return row_level, col_level
+
+
+def _amplitude(profiles: np.ndarray, map_values: np.ndarray) -> float:
+    """The scale ``a`` at which ``map_values`` best matches ``profiles`` (1 = the map at its estimated strength).
+
+    Per feature, the least-squares slope of the profiles on the map over the rows; the amplitude is the median of those
+    slopes weighted by each feature's map energy (sum of squared map values). A plain least squares over all features and
+    wells would be dominated by a few heavy-tailed features.
+    """
+    energy = (map_values * map_values).sum(axis=0)
+    ok = energy > 0
+    if not ok.any():
+        return 0.0
+    slope = (profiles[:, ok] * map_values[:, ok]).sum(axis=0) / energy[ok]
+    w = energy[ok]
+    order = np.argsort(slope)
+    cum = np.cumsum(w[order])
+    return float(slope[order][np.searchsorted(cum, cum[-1] / 2)])
+
+
+def _shrink_amplitude(amplitudes: dict, target) -> float:
+    """Shrink one layout's amplitude toward the precision-weighted average of the other layouts' (empirical Bayes).
+
+    ``tau2 = max(0, var(others) - mean(se^2))`` is the layout-to-layout variance left after sampling error; the result is
+    ``mean + w * (own - mean)`` with ``w = tau2 / (tau2 + own_se^2)``. The target does not enter the mean or tau2.
+    """
+    others = [v for k, v in amplitudes.items() if k != target]
+    if len(others) < 2:
+        return amplitudes[target][0]
+    amps = np.array([v[0] for v in others])
+    ses = np.array([v[1] for v in others])
+    tau2 = max(0.0, amps.var(ddof=1) - np.mean(ses ** 2))
+    mean = np.average(amps, weights=1.0 / (ses ** 2 + tau2 + 1e-12))
+    own, own_se = amplitudes[target]
+    w = tau2 / (tau2 + own_se ** 2) if tau2 + own_se ** 2 > 0 else 0.0
+    return float(mean + w * (own - mean))
+
+
+def estimate_effects(
+    profiles: pd.DataFrame,
+    features: Sequence[str],
+    log_cell_count: np.ndarray,
+    control_query: str,
+    plate_column: str = PLATE_COLUMN,
+    well_column: str = WELL_COLUMN,
+    batch_id_column: str = BATCH_ID_COLUMN,
+    layout: Sequence | None = None,
+    compound_columns: tuple[int, int] = (3, 22),
+    control_columns: Sequence[int] = (2, 24),
+    winsor: tuple[float, float] = (0.05, 0.95),
+    n_backfit_iter: int = 6,
+    n_boot: int = 200,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray, pd.Series, pd.DataFrame]:
+    """The cell-count (density) effect and the plate-position effect on every well, in the units of ``profiles``.
+
+    ``profiles`` must already be centred and scaled per plate on its controls, so plates share units. As in the CFReT
+    screen, each effect is one shared model plus, for position, one amplitude per plate layout:
+
+    Density: for each feature, one slope against the (winsorized) log cell count, estimated from all control wells'
+    variation inside each plate and column (control wells are identical, so count-linked variation there is artifact).
+    Applied to compound wells through their plate-centred, winsorized log count, and to control wells through their
+    count centred within plate and column (column-level differences are not touched).
+
+    Position: ONE additive row + column map per feature, fitted with medians (values are heavy-tailed) on the
+    replicate-averaged compound wells of all layouts after the density effect; and one *amplitude* per layout, the
+    least-squares scale at which the map fits that layout's own compound wells. The amplitude's standard error is
+    bootstrapped over the layout's compound-position profiles, and the amplitude is shrunk toward the other layouts'
+    (empirical Bayes). The position effect of a compound well is ``amplitude[layout] * map(row, column)``; a control
+    well in columns 2/24 receives the row part of the map only.
+
+    Wells without a cell count receive no density effect. Returns (density effects, position effects, layout label per
+    well, per-layout amplitude table); the first two are (n wells x n features).
+    """
+    features = list(features)
+    n = len(profiles)
+    X = profiles[features].to_numpy(dtype=float)
+    parts = split_well(profiles[well_column])
+    row = parts["well_row"].map({ch: i for i, ch in enumerate("ABCDEFGHIJKLMNOP")}).to_numpy()
+    col = parts["well_column"].to_numpy()
+    plate = profiles[plate_column].astype(str).to_numpy()
+    compound = extract_compound_id(profiles[batch_id_column])
+    if layout is None:
+        raise ValueError("layout labels are required (see layouts_from_platemaps)")
+    layout = np.asarray(layout)
+    is_control = control_mask(profiles, control_query)
+    lo_c, hi_c = compound_columns
+    is_comp = compound.notna().to_numpy() & (col >= lo_c) & (col <= hi_c)
+    is_ctrl_col = is_control & np.isin(col, list(control_columns))
+    logn = np.asarray(log_cell_count, dtype=float)
+    has_n = np.isfinite(logn)
+    n_rows, n_cols = PLATE_ROWS, hi_c - lo_c + 1
+
+    # density covariates: compound wells plate-centred and winsorized, control wells centred within plate x column
+    z_comp = np.zeros(n)
+    sel = is_comp & has_n
+    zc = logn[sel] - pd.Series(logn[sel]).groupby(plate[sel]).transform("mean").to_numpy()
+    q = pd.Series(zc).groupby(plate[sel]).quantile(list(winsor)).unstack()
+    z_comp[sel] = np.clip(zc, pd.Series(plate[sel]).map(q[winsor[0]]).to_numpy(), pd.Series(plate[sel]).map(q[winsor[1]]).to_numpy())
+    z_ctrl = np.zeros(n)
+    selc = is_ctrl_col & has_n
+    key = [plate[selc], col[selc]]
+    zd = logn[selc] - pd.Series(logn[selc]).groupby(key).transform("mean").to_numpy()
+    qd = pd.Series(zd).groupby(plate[selc]).quantile(list(winsor)).unstack()
+    z_ctrl[selc] = np.clip(zd, pd.Series(plate[selc]).map(qd[winsor[0]]).to_numpy(), pd.Series(plate[selc]).map(qd[winsor[1]]).to_numpy())
+
+    # one density slope per feature
+    if selc.sum() >= 3:
+        Yd = X[selc] - pd.DataFrame(X[selc]).groupby(key).transform("mean").to_numpy()
+        zc_d = logn[selc] - pd.Series(logn[selc]).groupby(key).transform("mean").to_numpy()
+        beta = (zc_d[:, None] * Yd).sum(axis=0) / (zc_d ** 2).sum()
+    else:
+        beta = np.zeros(X.shape[1])
+    density = np.zeros_like(X)
+    density[is_comp & has_n] = np.outer(z_comp[is_comp & has_n], beta)
+    density[is_ctrl_col & has_n] = np.outer(z_ctrl[is_ctrl_col & has_n], beta)
+
+    def compound_profiles(wells):
+        """Replicate-averaged, plate-centred, density-removed compound-position profiles (+ their row/column)."""
+        Y = X[wells] - np.outer(z_comp[wells], beta)
+        Y = Y - pd.DataFrame(Y).groupby(plate[wells]).transform("mean").to_numpy()
+        gid = pd.DataFrame({"c": compound.to_numpy()[wells], "r": row[wells], "k": col[wells]}).groupby(
+            ["c", "r", "k"], sort=False).ngroup().to_numpy()
+        m = gid.max() + 1
+        P = np.zeros((m, Y.shape[1]))
+        np.add.at(P, gid, Y)
+        P /= np.bincount(gid, minlength=m)[:, None]
+        first = pd.DataFrame({"g": gid, "r": row[wells], "k": col[wells]}).drop_duplicates("g").sort_values("g")
+        return P, first["r"].to_numpy().astype(int), (first["k"].to_numpy() - lo_c).astype(int)
+
+    # one shared position map from all compound wells
+    all_wells = np.where(is_comp & has_n)[0]
+    P, r, c = compound_profiles(all_wells)
+    row_level, col_level = _backfit_median(P, r, c, n_rows, n_cols, n_backfit_iter)
+    position_map = np.zeros_like(X)
+    tg = np.where(is_comp)[0]
+    position_map[tg] = row_level[row[tg].astype(int)] + col_level[(col[tg] - lo_c).astype(int)]
+
+    # one amplitude per layout
+    rng = np.random.default_rng(seed)
+    raw = {}
+    for lay in pd.unique(layout):
+        wells = np.where((layout == lay) & is_comp & has_n)[0]
+        if len(wells) == 0:
+            continue
+        P, r, c = compound_profiles(wells)
+        T = row_level[r] + col_level[c]
+        if not (T * T).sum() > 0:
+            continue
+        boots = [_amplitude(P[i], T[i]) for i in (rng.integers(0, len(P), len(P)) for _ in range(n_boot))]
+        raw[lay] = (_amplitude(P, T), float(np.std(boots)), len(P))
+    position = np.zeros_like(X)
+    rows_out = []
+    for lay in pd.unique(layout):
+        in_lay = (layout == lay) & is_comp
+        if lay in raw:
+            a = _shrink_amplitude({k: (v[0], v[1]) for k, v in raw.items()}, lay)
+            position[in_lay] = a * position_map[in_lay]
+            # control wells: the row part of the map only (no compound sits in their columns, so the column level of
+            # columns 2/24 is not estimated; E3 already set their column-level distribution)
+            ctrl = (layout == lay) & is_ctrl_col
+            position[ctrl] = a * row_level[row[ctrl].astype(int)]
+            rows_out.append({"layout": lay, "n_profiles": raw[lay][2], "raw_amplitude": raw[lay][0],
+                             "se": raw[lay][1], "amplitude": a})
+        else:
+            rows_out.append({"layout": lay, "n_profiles": 0, "raw_amplitude": np.nan, "se": np.nan, "amplitude": 0.0})
+    return density, position, pd.Series(layout, index=profiles.index, name="layout"), pd.DataFrame(rows_out)
+
+
+def plate_scale(
+    profiles: pd.DataFrame,
+    features: Sequence[str],
+    control_query: str,
+    plate_column: str = PLATE_COLUMN,
+) -> pd.DataFrame:
+    """Each plate's centre and scale per feature, from its control wells, with pycytominer's ``RobustMAD``.
+
+    ``RobustMAD`` is what ``normalize(method="mad_robustize")`` fits: the median and the MAD (scaled by pycytominer's
+    own 1.4826 convention). Returned long: one row per (plate, statistic in {"median", "scale"}), one column per feature,
+    so the same constants can be applied to wells and to single cells (`apply_plate_scale`).
+    """
+    features = list(features)
+    rows = []
+    for plate, frame in profiles.groupby(plate_column, sort=False):
+        controls = frame.loc[control_mask(frame, control_query), features]
+        if len(controls) < 3:
+            raise ValueError(f"plate {plate} has fewer than 3 control wells")
+        fitted = RobustMAD().fit(controls)
+        rows.append(pd.concat([pd.Series({plate_column: plate, "statistic": "median"}), fitted.median]))
+        rows.append(pd.concat([pd.Series({plate_column: plate, "statistic": "scale"}), fitted.mad]))
+    out = pd.DataFrame(rows).reset_index(drop=True)
+    out[features] = out[features].astype(float)
+    return out
+
+
+def apply_plate_scale(
+    values: np.ndarray, plates: np.ndarray, scale_table: pd.DataFrame, features: Sequence[str],
+    plate_column: str = PLATE_COLUMN, epsilon: float = 1e-18,
+) -> np.ndarray:
+    """``RobustMAD.transform`` with each row's own plate constants: (values - median) / (scale + epsilon)."""
+    features = list(features)
+    med = scale_table[scale_table["statistic"] == "median"].set_index(plate_column)[features]
+    sca = scale_table[scale_table["statistic"] == "scale"].set_index(plate_column)[features]
+    plates = np.asarray(plates)
+    out = np.empty(values.shape, dtype=np.float64)
+    for p in pd.unique(plates):
+        r = plates == p
+        scaler = RobustMAD(epsilon=epsilon)
+        scaler.median, scaler.mad = med.loc[p], sca.loc[p]
+        out[r] = scaler.transform(pd.DataFrame(values[r], columns=features)).to_numpy()
+    return out

@@ -1,0 +1,41 @@
+[project]
+name = "pccma-repo1-screen-image-profiling"
+version = "0.1.0"
+description = "Image-based profiling of the PCCMA REPO1 screens (CHP-134, SK-N-AS)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # profiling (bulk_pipeline, bulk_utils, single_cell_utils); pycytominer 1.7.1 needs scipy >= 1.16.1 on Python >= 3.11
+    "pycytominer==1.7.1",
+    "pandas==2.3.3",
+    "numpy>=1.26",
+    "scipy>=1.16.1",
+    "scikit-learn==1.7.2",
+    "pyarrow==20.0.0",
+    "openpyxl>=3.1",
+    # notebooks (generated from utils/_build templates) and papermill-driven QC
+    "nbformat>=5.10",
+    "nbconvert>=7.16",
+    "papermill>=2.6",
+    "ipykernel",
+    "jupyter",
+]
+
+[dependency-groups]
+# conversion and cell-level QC (steps 0-2)
+upstream = [
+    "cytotable",
+    "cosmicqc>=0.1.0",
+    "cytodataframe>0.0.17",
+    "dask[dataframe]",
+    "duckdb",
+    "tifffile",
+]
+# plots and embeddings
+analysis = ["matplotlib", "seaborn", "umap-learn>=0.5.5", "tabulate"]
+# position_effect_diagnostics/ (replicate and artifact retrieval)
+diagnostics = ["copairs>=0.5.4"]
+
+[tool.uv]
+package = false
+default-groups = ["upstream", "analysis", "diagnostics"]
