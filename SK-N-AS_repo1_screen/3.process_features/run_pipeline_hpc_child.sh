@@ -48,27 +48,18 @@ if [ $? -ne 0 ]; then
 fi
 
 # Step 3: aggregation (per-plate only -- the whole-screen steps that follow,
-# 3b.pooled_bulk_processing.ipynb and 3c.sphering.ipynb, are not run here; run
-# them locally instead, once every plate's aggregated profile is in)
+# 3a.well_cell_counts.ipynb and 3b.pooled_bulk_processing.ipynb, are not run here; run
+# them once every plate's aggregated profile is in)
 PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/3.aggregate_bulk_profiles.py
 if [ $? -ne 0 ]; then
     echo "Aggregation FAILED for plate: $plate_id"
     failed_steps+=("aggregate")
 fi
 
-# Step 4: single-cell normalization
-PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/4.single_cell_normalize.py
-if [ $? -ne 0 ]; then
-    echo "Single-cell normalization FAILED for plate: $plate_id"
-    failed_steps+=("single_cell_normalize")
-fi
-
-# Step 5: single-cell feature selection
-PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/5.single_cell_feature_select.py
-if [ $? -ne 0 ]; then
-    echo "Single-cell feature selection FAILED for plate: $plate_id"
-    failed_steps+=("single_cell_feature_select")
-fi
+# Steps after this need the whole-screen tables from 3a.well_cell_counts and 3b.pooled_bulk_processing, so they are
+# not run here. Once every plate's aggregate is in, run 3a and 3b once, then submit
+# run_single_cell_hpc_child.sh per plate with STAGE=stats, run 5b.single_cell_feature_select once, and submit it
+# again per plate with STAGE=apply.
 
 conda deactivate
 

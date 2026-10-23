@@ -20,7 +20,7 @@ jupyter nbconvert --to=script --FilesWriter.build_directory=nbconverted/ *.ipynb
 # data/converted_profiles directory in this repo checkout on scratch, in
 # case a plate hasn't been synced to koala yet. Must match the
 # Alpine-detection branch in 1.single_cell_qc.ipynb through
-# 5.single_cell_feature_select.ipynb.
+# 3.aggregate_bulk_profiles.ipynb.
 koala_dir="/pl/active/koala/ALSF_screen_data/SK-N-AS_repo1_profiles/converted_profiles"
 scratch_dir="data/converted_profiles"
 if [ -d "$koala_dir" ]; then
@@ -52,10 +52,9 @@ for plate_id in "${plate_ids[@]}"; do
     echo "Found: $plate_id"
 done
 
-# loop over each plate and submit a child job. Runs steps 1-5 only -- the
-# whole-screen steps are not run on HPC; run 3b.pooled_bulk_processing.ipynb
-# and 3c.sphering.ipynb locally once every plate's aggregated output has been
-# synced back.
+# loop over each plate and submit a child job. Runs steps 1-3 only (QC, annotation,
+# aggregation) -- the whole-screen steps (3a, 3b, 5b) and the single-cell
+# stages (run_single_cell_hpc_child.sh) follow once every plate's aggregate is in.
 for plate_id in "${plate_ids[@]}"; do
     # check job count for this user
     number_of_jobs=$(squeue -u "$USER" | wc -l)
