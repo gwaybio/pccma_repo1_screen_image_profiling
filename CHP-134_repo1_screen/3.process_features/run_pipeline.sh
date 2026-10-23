@@ -1,20 +1,24 @@
 #!/bin/bash
 #
 # Run the full feature-processing pipeline, in order:
-#   1.merge_profiles.ipynb       -> one merged parquet per plate (via nbconverted script)#   2.single_cell_qc.ipynb       -> one QC-annotations parquet per plate (via papermill,#                                    which keeps the executed notebook per plate for review)
-#   3.aggregate_bulk_profiles.ipynb -> per-plate annotated and aggregated (un-normalized) bulk profiles#                                    (via nbconverted script, one plate/process at a time)
-#   3b.pooled_bulk_processing.ipynb -> whole-screen processing of the pooled per-plate aggregated#                                    profiles in the JUMP recipe's way (variant filter, MAD,
-#                                    inverse normal transform, feature selection)
-#   3c.sphering.ipynb            -> whole-screen sphering of that pooled profile#   4.single_cell_processing.ipynb -> annotated/normalized/feature-selected single-cell profiles#                                    (via nbconverted script, one plate/process at a time)
+#   0b.merge_profiles.ipynb             -> one merged parquet per plate
+#   1.single_cell_qc.ipynb              -> one QC-annotations parquet per plate (via papermill)
+#   2.annotate.ipynb                    -> one annotated, QC-passed single-cell profile per plate
+#   3.aggregate_bulk_profiles.ipynb     -> per-plate aggregated (un-normalized) bulk profiles
+#   3a.well_cell_counts.ipynb           -> cells per well (whole screen)
+#   3b.pooled_bulk_processing.ipynb     -> whole-screen bulk profiles and the well/plate correction tables
+#   4b.single_cell_correct.ipynb        -> STAGE=stats: statistics of every normalized single cell, per plate
+#   5b.single_cell_feature_select.ipynb -> single-cell features selected on all cells' statistics (whole screen)
+#   4b.single_cell_correct.ipynb        -> STAGE=apply: corrected, normalized single cells per plate
 #
-# Steps 3 and 4 run one plate per `python` invocation (PLATE_ID env var) rather
+# Steps 2 and 3 run one plate per `python` invocation (PLATE_ID env var) rather
 # than looping over all plates inside a single long-lived process. Each plate's
 # memory is fully released back to the OS when its process exits, which avoids
 # the cross-plate memory buildup that can otherwise lead to an OOM kill partway
 # through a batch.
 #
 # Each plate's per-stage timing (and a total) is appended to
-# data/bulk_profiles/timing_log.csv and data/single_cell_profiles/timing_log.csv.
+# data/annotated_profiles/timing_log.csv and data/bulk_profiles/timing_log.csv.
 #
 # By default, every step skips a plate that already has output. Set
 # OVERWRITE=1 (e.g. `OVERWRITE=1 ./run_pipeline.sh`) to reprocess and
@@ -41,12 +45,12 @@ trap print_total_time EXIT
 # -----------------------------
 # Initialize environment
 # -----------------------------
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate pccma_repo1_preprocessing_env
-if [ $? -ne 0 ]; then
-    echo "Failed to activate conda env pccma_repo1_preprocessing_env; aborting."
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [ ! -x "$repo_root/.venv/bin/python" ]; then
+    echo "uv environment not found at $repo_root/.venv; run 'uv sync' in $repo_root first; aborting."
     exit 1
 fi
+source "$repo_root/.venv/bin/activate"
 
 failed_plates=()
 
@@ -58,25 +62,25 @@ if [ $? -ne 0 ]; then
 fi
 
 # -----------------------------
-# Step 1: merge row-batch profiles into one profile per plate
+# Step 0b: merge row-batch profiles into one profile per plate
 # -----------------------------
 echo "======================================"
-echo "Step 1: 1.merge_profiles.ipynb"
+echo "Step 0b: 0b.merge_profiles.ipynb"
 echo "======================================"
-OVERWRITE="$overwrite" python nbconverted/1.merge_profiles.py
+OVERWRITE="$overwrite" python nbconverted/0b.merge_profiles.py
 if [ $? -ne 0 ]; then
-    echo "1.merge_profiles.py FAILED (incomplete merge); aborting pipeline before QC."
+    echo "0b.merge_profiles.py FAILED (incomplete merge); aborting pipeline before QC."
     exit 1
 fi
 
 # -----------------------------
-# Step 2: per-plate single-cell QC via papermill
+# Step 1: per-plate single-cell QC via papermill
 # -----------------------------
 echo "======================================"
-echo "Step 2: 2.single_cell_qc.ipynb (papermill, per plate)"
+echo "Step 1: 1.single_cell_qc.ipynb (papermill, per plate)"
 echo "======================================"
 
-qc_notebook_dir="./executed_notebooks/2.single_cell_qc"
+qc_notebook_dir="./executed_notebooks/1.single_cell_qc"
 mkdir -p "$qc_notebook_dir"
 
 mapfile -t plate_ids < <(find ./data/merged_profiles -maxdepth 1 -name "*.parquet" -printf "%f\n" | sed 's/\.parquet$//' | sort)
@@ -99,7 +103,7 @@ for plate_id in "${plate_ids[@]}"; do
     # bottom of the notebook doesn't depend on them. Leaving this on for a
     # batch run across many plates is what causes each plate to take a very
     # long time (or effectively hang) here.
-    papermill 2.single_cell_qc.ipynb "$executed_notebook" \
+    papermill 1.single_cell_qc.ipynb "$executed_notebook" \
         -p plate_id "$plate_id" \
         -p render_diagnostics False
     exit_code=$?
@@ -109,6 +113,35 @@ for plate_id in "${plate_ids[@]}"; do
         failed_plates+=("qc:${plate_id}")
     else
         echo "QC done for plate: ${plate_id}"
+    fi
+done
+
+# -----------------------------
+# Step 2: annotate (one plate/process at a time). Attaches the platemap, drops the poor-quality
+# segmentations (the QC flags) and writes data/annotated_profiles/<plate>_annotated.parquet.
+# Skips plates without QC, and already-annotated plates.
+# -----------------------------
+echo "======================================"
+echo "Step 2: 2.annotate.ipynb (one plate at a time)"
+echo "======================================"
+
+for plate_id in "${plate_ids[@]}"; do
+    annotated_output="./data/annotated_profiles/${plate_id}_annotated.parquet"
+
+    if [ -f "$annotated_output" ] && [ -z "$overwrite" ]; then
+        echo "✅ ${plate_id} already annotated (found ${annotated_output})"
+        continue
+    fi
+
+    echo ">>> Annotating ${plate_id}"
+    PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/2.annotate.py
+    exit_code=$?
+
+    if [ "$exit_code" -ne 0 ]; then
+        echo "Annotation FAILED for plate: ${plate_id} (exit code $exit_code)"
+        failed_plates+=("annotate:${plate_id}")
+    else
+        echo "Annotation done for plate: ${plate_id}"
     fi
 done
 
@@ -141,14 +174,36 @@ for plate_id in "${plate_ids[@]}"; do
 done
 
 # -----------------------------
+# Step 3a: cells per well (whole screen, run once). Counts the QC-passed cells in
+# every well from the annotated single-cell profiles (reads only the well column).
+# 3b needs the counts to estimate the cell-count effect. Resumable: plates already in
+# <screen profiles>/bulk_profiles/<screen>_well_cell_counts.csv (on the bandicoot mount) are skipped.
+# -----------------------------
+echo "======================================"
+echo "Step 3a: 3a.well_cell_counts.ipynb (whole screen)"
+echo "======================================"
+
+echo ">>> Counting cells per well for the whole screen"
+OVERWRITE="$overwrite" python nbconverted/3a.well_cell_counts.py
+exit_code=$?
+
+if [ "$exit_code" -ne 0 ]; then
+    echo "Cell counting FAILED (exit code $exit_code)"
+    failed_plates+=("well_cell_counts:whole_screen")
+else
+    echo "Cell counting done for whole screen"
+fi
+
+# -----------------------------
 # Step 3b: pooled bulk processing (whole screen, run once). Pools every plate's
-# un-normalized aggregated profile (from step 3) and processes it the way the
-# JUMP profiling recipe does: drop NaN/inf features, per-plate variant filter,
-# MAD normalization per plate, inverse normal transform, pooled feature
-# selection. It reads the per-plate *_bulk_aggregated.parquet files from
-# data/bulk_profiles (or, if that folder has none, from the bandicoot mount)
-# and writes <screen>_pooled_bulk_feature_selected.parquet to data/bulk_profiles.
-# It always recomputes, overwriting its local output.
+# un-normalized aggregated profile (from step 3) and processes it in the order correct,
+# normalize, rank-transform, select (see 3b.pooled_bulk_processing.ipynb): drop NaN/inf
+# features, line up and match the DMSO columns, per-plate variant filter, subtract the
+# cell-count and plate-position effects, MAD normalization per plate, inverse normal
+# transform, pooled feature selection. It reads the per-plate *_bulk_aggregated.parquet files
+# and the cell counts from, and writes the <screen>_pooled_bulk_*_feature_selected.parquet
+# profiles and the <screen>_correction_* tables to, <screen profiles>/bulk_profiles on the
+# bandicoot mount (PROFILES_DIR overrides it). It always recomputes, overwriting its output.
 # -----------------------------
 echo "======================================"
 echo "Step 3b: 3b.pooled_bulk_processing.ipynb (whole screen)"
@@ -166,55 +221,74 @@ else
 fi
 
 # -----------------------------
-# Step 3c: sphering (whole screen, run once). Fits the whitening transform on
-# the pooled negative controls and applies it across the whole pooled screen,
-# writing <screen>_pooled_bulk_spherized.parquet to data/spherized_profiles.
-# Always recomputes, overwriting its local output.
+# Step 4b-stats: single-cell statistics (one plate/process at a time)
+# Applies the 3b constants to every QC-passed cell (all variant features) and accumulates exact statistics
+# of the plate's cells for feature selection. Writes <screen profiles>/single_cell_profiles/<plate>_sc_<variant>_stats.pkl.
+# Needs scratch space for the plate's normalized matrix (SCRATCH_DIR; about 21 GB for the largest SK-N-AS plate).
 # -----------------------------
 echo "======================================"
-echo "Step 3c: 3c.sphering.ipynb (whole screen)"
+echo "Step 4b-stats: single-cell statistics (one plate/process at a time)"
 echo "======================================"
 
-echo ">>> Running sphering for the whole screen"
-python nbconverted/3c.sphering.py
-exit_code=$?
-
-if [ "$exit_code" -ne 0 ]; then
-    echo "Sphering FAILED (exit code $exit_code)"
-    failed_plates+=("sphering:whole_screen")
-else
-    echo "Sphering done for whole screen"
-fi
-
-# -----------------------------
-# Step 4: single-cell processing (one plate/process at a time; skips plates
-# without QC, and already-processed plates)
-# -----------------------------
-echo "======================================"
-echo "Step 4: 4.single_cell_processing.ipynb (one plate at a time)"
-echo "======================================"
-
+variant="${VARIANT:-corrected}"
 for plate_id in "${plate_ids[@]}"; do
-    sc_output="./data/single_cell_profiles/${plate_id}_sc_feature_selected.parquet"
-
-    if [ -f "$sc_output" ] && [ -z "$overwrite" ]; then
-        echo "✅ ${plate_id} already processed (found ${sc_output})"
-        continue
-    fi
-
-    echo ">>> Running single-cell processing for ${plate_id}"
-    PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/4.single_cell_processing.py
+    plate_key="${plate_id// /_}"
+    echo ">>> Single-cell statistics for ${plate_id}"
+    STAGE="stats" PLATE_ID="$plate_key" OVERWRITE="$overwrite" VARIANT="$variant" python nbconverted/4b.single_cell_correct.py
     exit_code=$?
 
     if [ "$exit_code" -ne 0 ]; then
-        echo "Single-cell processing FAILED for plate: ${plate_id} (exit code $exit_code)"
-        failed_plates+=("single_cell_processing:${plate_id}")
+        echo "Single-cell stats FAILED for plate: ${plate_id} (exit code $exit_code)"
+        failed_plates+=("single_cell_stats:${plate_id}")
     else
-        echo "Single-cell processing done for plate: ${plate_id}"
+        echo "Single-cell stats done for plate: ${plate_id}"
     fi
 done
 
-conda deactivate
+# -----------------------------
+# Step 5b: single-cell feature selection (whole screen, run once). Adds up the plates'
+# statistics and runs pycytominer's filters on all cells, independently of the bulk profiles; writes
+# <screen profiles>/bulk_profiles/<screen>_sc_selected_features_<variant>.json.
+# -----------------------------
+echo "======================================"
+echo "Step 5b: 5b.single_cell_feature_select.ipynb (whole screen)"
+echo "======================================"
+
+VARIANT="${VARIANT:-corrected}" python nbconverted/5b.single_cell_feature_select.py
+exit_code=$?
+
+if [ "$exit_code" -ne 0 ]; then
+    echo "Single-cell feature selection FAILED (exit code $exit_code)"
+    failed_plates+=("single_cell_feature_select:whole_screen")
+else
+    echo "Single-cell feature selection done for whole screen"
+fi
+
+# -----------------------------
+# Step 4b-apply: corrected, normalized single cells (one plate/process at a time)
+# Writes <screen profiles>/single_cell_profiles/<plate>_sc_<variant>_feature_selected.parquet: every QC-passed cell, the
+# selected features only, no inverse normal transform. Single cells are never sphered.
+# -----------------------------
+echo "======================================"
+echo "Step 4b-apply: corrected, normalized single cells (one plate/process at a time)"
+echo "======================================"
+
+variant="${VARIANT:-corrected}"
+for plate_id in "${plate_ids[@]}"; do
+    plate_key="${plate_id// /_}"
+    echo ">>> Single-cell apply for ${plate_id}"
+    STAGE="apply" PLATE_ID="$plate_key" OVERWRITE="$overwrite" VARIANT="$variant" python nbconverted/4b.single_cell_correct.py
+    exit_code=$?
+
+    if [ "$exit_code" -ne 0 ]; then
+        echo "Single-cell apply FAILED for plate: ${plate_id} (exit code $exit_code)"
+        failed_plates+=("single_cell_apply:${plate_id}")
+    else
+        echo "Single-cell apply done for plate: ${plate_id}"
+    fi
+done
+
+deactivate
 
 echo "======================================"
 echo "Pipeline finished."
