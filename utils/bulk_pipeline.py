@@ -89,6 +89,15 @@ def _log_timing(path: pathlib.Path, header: list[str], row: list[str]) -> None:
         writer.writerow(row)
 
 
+def _input_dir(env_var: str, local_dir: pathlib.Path, mount_dir: pathlib.Path, glob: str) -> pathlib.Path:
+    """Where a whole-screen step reads its per-plate inputs: $env_var if set; else the folder the per-plate steps wrote to
+    (`local_dir`) if it holds any matching file, so a full `run_pipeline.sh` run needs no copying; else the screen's folder on
+    the bandicoot mount (`mount_dir`), where the per-plate files are kept once a screen is finished."""
+    if os.environ.get(env_var):
+        return pathlib.Path(os.environ[env_var]).expanduser()
+    return local_dir if any(local_dir.glob(glob)) else mount_dir
+
+
 def _platemap_path(config: ScreenConfig, barcode_platemap: pd.DataFrame, plate_id: str):
     plate_col, file_col = config.platemap_columns
     rows = barcode_platemap.loc[barcode_platemap[plate_col] == plate_id, file_col]
@@ -219,10 +228,11 @@ def count_cells_per_well(config: ScreenConfig) -> pathlib.Path:
     """Count the quality-controlled cells of every well from the annotated profiles (only the plate and well columns are read).
 
     Plates already in the output are skipped ($OVERWRITE=1 recounts everything); the file is rewritten after every plate.
-    ANNOTATED_DIR overrides where the annotated profiles are read from.
+    The annotated profiles are read from `ANNOTATED_DIR` if set, else from the annotate step's output folder if it has any,
+    else from the screen's folder on the mount.
     """
     profiles_dir = pathlib.Path(os.environ.get("PROFILES_DIR", config.profiles_dir)).expanduser()
-    annotated_dir = pathlib.Path(os.environ.get("ANNOTATED_DIR", str(profiles_dir / config.annotated_subdir))).expanduser()
+    annotated_dir = _input_dir("ANNOTATED_DIR", config.annotated_dir, profiles_dir / config.annotated_subdir, config.annotated_glob)
     output_file = profiles_dir / "bulk_profiles" / f"{config.screen_name}_well_cell_counts.csv"
     overwrite = os.environ.get("OVERWRITE", "").strip().lower() in ("1", "true", "yes")
     files = sorted(annotated_dir.glob(config.annotated_glob))
@@ -258,7 +268,8 @@ def run_pooled_bulk_processing(config: ScreenConfig) -> None:
     """Pool the plates and run the corrections, normalization, rank transform and feature selection (see bulk_utils).
 
     Reads the per-plate aggregates and the cell counts from, and writes the bulk profiles and the correction tables to,
-    the screen's profiles folder (PROFILES_DIR overrides it; BULK_PROFILES_DIR overrides where the aggregates are read from).
+    the screen's profiles folder (PROFILES_DIR overrides it). The per-plate aggregates are read from `BULK_PROFILES_DIR` if set,
+    else from the aggregate step's output folder if it has any, else from the screen's folder on the mount.
     """
     screen_name = config.screen_name
     profiles_dir = pathlib.Path(os.environ.get("PROFILES_DIR", config.profiles_dir)).expanduser()
@@ -271,7 +282,7 @@ def run_pooled_bulk_processing(config: ScreenConfig) -> None:
     correlation_threshold = config.thresholds["correlation_threshold"]
     barcode_platemap_file = pathlib.Path(config.platemap_dir) / "barcode_platemap.csv"
 
-    aggregate_dir = pathlib.Path(os.environ["BULK_PROFILES_DIR"]).expanduser() if os.environ.get("BULK_PROFILES_DIR") else bulk_dir
+    aggregate_dir = _input_dir("BULK_PROFILES_DIR", config.bulk_dir, bulk_dir, config.per_plate_glob)
     plate_files = sorted(aggregate_dir.glob(config.per_plate_glob))
     if not plate_files:
         raise FileNotFoundError(f"no per-plate profile files matching {config.per_plate_glob} in {aggregate_dir}")

@@ -4,8 +4,9 @@
 # Counts the quality-controlled single cells in every well. The count is the covariate of the cell-count effect that
 # `3b.pooled_bulk_processing` estimates and removes. Only the plate and well columns of each annotated profile
 # are read, so this is fast. Plates already in the output are skipped (set `OVERWRITE=1` to recount everything).
-# `PROFILES_DIR` and `ANNOTATED_DIR` override where the files are read and written. The processing is
-# `bulk_pipeline.count_cells_per_well`.
+# The annotated profiles are read from `data/annotated_profiles` (the output of `2.annotate`) if it has any, else from the
+# screen's folder on the bandicoot mount; `ANNOTATED_DIR` overrides this. The counts are written to the mount (`PROFILES_DIR`
+# overrides it). The processing is `bulk_pipeline.count_cells_per_well`.
 
 # %% [markdown]
 # ## Run

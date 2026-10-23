@@ -175,7 +175,7 @@ done
 
 # -----------------------------
 # Step 3a: cells per well (whole screen, run once). Counts the QC-passed cells in
-# every well from the annotated single-cell profiles (reads only the well column).
+# every well from the annotated profiles of step 2 (reads only the well column).
 # 3b needs the counts to estimate the cell-count effect. Resumable: plates already in
 # <screen profiles>/bulk_profiles/<screen>_well_cell_counts.csv (on the bandicoot mount) are skipped.
 # -----------------------------
@@ -201,7 +201,7 @@ fi
 # features, line up and match the DMSO columns, per-plate variant filter, subtract the
 # cell-count and plate-position effects, MAD normalization per plate, inverse normal
 # transform, pooled feature selection. It reads the per-plate *_bulk_aggregated.parquet files
-# and the cell counts from, and writes the <screen>_pooled_bulk_*_feature_selected.parquet
+# of step 3 (from data/bulk_profiles, or the mount if that has none) and the cell counts from, and writes the <screen>_pooled_bulk_*_feature_selected.parquet
 # profiles and the <screen>_correction_* tables to, <screen profiles>/bulk_profiles on the
 # bandicoot mount (PROFILES_DIR overrides it). It always recomputes, overwriting its output.
 # -----------------------------

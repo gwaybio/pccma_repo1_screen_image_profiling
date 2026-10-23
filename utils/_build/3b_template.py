@@ -23,7 +23,9 @@
 # `4b.single_cell_correct` applies exactly the same constants to every single cell. No plate is filtered out.
 #
 # The processing is `bulk_pipeline.run_pooled_bulk_processing` (using `bulk_utils`); the steps are explained below.
-# `PROFILES_DIR` overrides where the files are read and written and `BULK_PROFILES_DIR` where the per-plate aggregates are read from.
+# The per-plate aggregates are read from `data/bulk_profiles` (the output of `3.aggregate_bulk_profiles`) if it has any, else
+# from the screen's folder on the bandicoot mount; `BULK_PROFILES_DIR` overrides this. The cell counts are read from, and the
+# results written to, the mount (`PROFILES_DIR` overrides it).
 
 # %% [markdown]
 # ## Run

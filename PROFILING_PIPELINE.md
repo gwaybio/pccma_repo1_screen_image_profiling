@@ -105,5 +105,3 @@ duplicates, split over three "plates", this gives exactly the same features as `
 - 2026-10-21: every stage of `utils/run_full_profiling.sh` finished for both screens with no missing or unreadable file
   (`utils/verify_outputs.py`); per-well medians of the corrected single cells equal the bulk profile by Spearman 1.000 on one
   plate per screen (80 features).
-
-Not run on this version: the leave-one-layout-out check of the amplitude estimate.
