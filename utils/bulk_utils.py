@@ -14,6 +14,7 @@ pycytominer provides the inverse normal transform and feature selection; everyth
 
 import pathlib
 import warnings
+from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -25,6 +26,15 @@ from scipy.stats import median_abs_deviation
 PLATE_COLUMN = "Metadata_Plate"
 WELL_COLUMN = "Metadata_Well"
 BATCH_ID_COLUMN = "Metadata_Batch_Id"
+SOLVENT_COLUMN = "Metadata_Solvent"
+
+# What a well is, read from the platemap columns (see `design_from_platemaps`): a compound well has a batch ID; a control well
+# has no compound but a solvent; an empty well has neither.
+EMPTY_WELL_QUERY = f"{BATCH_ID_COLUMN}.isna() and {SOLVENT_COLUMN}.isna()"
+NEGATIVE_CONTROL_QUERY = f"{BATCH_ID_COLUMN}.isna() and {SOLVENT_COLUMN}.notna()"
+
+# A distribution (for matching one set of wells onto another) needs at least this many wells; fewer is an error, not a skip.
+MIN_WELLS = 2
 
 
 def pool_plate_profiles(
@@ -161,6 +171,61 @@ def layouts_from_platemaps(
     return pd.Series(out, name="layout")
 
 
+@dataclass(frozen=True)
+class PlateDesign:
+    """The plate geometry the corrections work on, read from the platemaps (`design_from_platemaps`)."""
+
+    n_rows: int                    # 16 for a 384-well plate, 8 for a 96-well plate
+    n_columns: int
+    control_columns: tuple         # columns whose wells hold controls and no compound
+    interior_columns: tuple        # columns that hold compounds (consecutive); their wells are the baseline for the other columns
+    outer_columns: tuple           # every other column (the control columns and any empty ones)
+
+
+def design_from_platemaps(barcode_platemap_csv: pathlib.Path, platemap_dir: pathlib.Path) -> PlateDesign:
+    """Which plate columns hold compounds and which hold controls, from the screen's platemap files.
+
+    A well with a batch ID is a compound well; a well with no batch ID but a solvent is a control well; a well with neither
+    is empty. The interior columns are the ones that have compound wells in any platemap, the control columns are the ones
+    that have control wells, and every other column is an outer column. Raises if the platemaps disagree about the control
+    columns, if a control column also holds compounds (the column-wise corrections need controls apart from the compounds),
+    or if the compound columns are not consecutive.
+    """
+    table = pd.read_csv(barcode_platemap_csv)
+    rows, compound_columns, control_sets, n_columns = set(), set(), {}, 0
+    for name in table.iloc[:, 1].astype(str).unique():
+        platemap = pd.read_csv(pathlib.Path(platemap_dir) / name)
+        found = {key: next((c for c in platemap.columns if key in c.lower()), None) for key in ("well", "batch", "solvent")}
+        if None in found.values():
+            raise ValueError(f"{name}: a well, a batch and a solvent column are needed to read the plate design; found {found}")
+        parts = split_well(platemap[found["well"]].astype(str))
+        compound = platemap[found["batch"]].notna().to_numpy()
+        control = ~compound & platemap[found["solvent"]].notna().to_numpy()
+        rows |= set(parts["well_row"].dropna())
+        n_columns = max(n_columns, int(parts["well_column"].max()))
+        compound_columns |= set(parts.loc[compound, "well_column"].astype(int))
+        control_sets[name] = frozenset(parts.loc[control, "well_column"].astype(int))
+    if any(len(r) != 1 for r in rows):
+        raise ValueError(f"only plates with single-letter rows are supported, found rows {sorted(rows)}")
+    if len(set(control_sets.values())) != 1:
+        raise ValueError(f"the platemaps disagree about which columns hold controls: { {n: sorted(c) for n, c in control_sets.items()} }")
+    control_columns = tuple(sorted(next(iter(control_sets.values()))))
+    interior = tuple(sorted(compound_columns))
+    if not control_columns or not interior:
+        raise ValueError(f"the platemaps need both control wells and compound wells (control columns {control_columns}, compound columns {interior})")
+    if set(control_columns) & set(interior):
+        raise ValueError(f"columns {sorted(set(control_columns) & set(interior))} hold both controls and compounds; the control-column corrections need them apart")
+    if list(interior) != list(range(interior[0], interior[-1] + 1)):
+        raise ValueError(f"the compound columns must be consecutive, found {list(interior)}")
+    return PlateDesign(
+        n_rows=max(ord(r.upper()) - ord("A") + 1 for r in rows),
+        n_columns=n_columns,
+        control_columns=control_columns,
+        interior_columns=interior,
+        outer_columns=tuple(c for c in range(1, n_columns + 1) if c not in interior),
+    )
+
+
 def plate_control_stats(
     profiles: pd.DataFrame,
     features: Sequence[str],
@@ -274,24 +339,23 @@ def align_control_columns(
     plate_column: str = PLATE_COLUMN,
     well_column: str = WELL_COLUMN,
     columns: Sequence[int] = (2, 24),
-    min_wells: int = 5,
 ) -> pd.DataFrame:
     """E3a. Within every plate, make the control (DMSO) wells of the two control columns follow the same distribution.
 
     Both control columns hold the same substance, so within a plate they should be interchangeable, yet each plate's
     column 2 differs from its column 24 by a stable, plate-specific offset (it flips sign between plates, so no shared
     correction can remove it). For each plate and feature the control wells of each column are mapped, rank-preserving,
-    onto the pooled distribution of that plate's control wells in both columns. A plate with fewer than ``min_wells``
-    control wells in either column is left unchanged.
+    onto the pooled distribution of that plate's control wells in both columns. A plate with fewer than `MIN_WELLS`
+    control wells in either column is an error.
     """
     features = list(features)
     col = split_well(profiles[well_column])["well_column"].to_numpy()
     is_control = control_mask(profiles, control_query)
     X = profiles[features].to_numpy(dtype=float).copy()
-    for _, idx in pd.Series(np.arange(len(profiles))).groupby(profiles[plate_column].to_numpy()).indices.items():
+    for plate, idx in pd.Series(np.arange(len(profiles))).groupby(profiles[plate_column].to_numpy()).indices.items():
         groups = [idx[is_control[idx] & (col[idx] == c)] for c in columns]
-        if any(len(g) < min_wells for g in groups):
-            continue
+        if any(len(g) < MIN_WELLS for g in groups):
+            raise ValueError(f"plate {plate}: {[len(g) for g in groups]} control wells in columns {list(columns)}; need at least {MIN_WELLS} in each")
         pooled = np.vstack([X[g] for g in groups])
         pooled_sorted = np.sort(pooled, axis=0)
         for g in groups:
@@ -311,16 +375,14 @@ def match_outer_columns(
     layout: Sequence | None = None,
     interior_columns: Iterable[int] = range(3, 23),
     outer_columns: Iterable[int] = (1, 2, 23, 24),
-    min_interior_wells: int = 20,
-    min_outer_wells: int = 5,
 ) -> pd.DataFrame:
     """E3. Map every outer plate column (the control columns) onto the distribution of the interior compound wells.
 
     For each layout (``layout``: one label per row, see `layouts_from_platemaps`) and each feature, the interior
     columns' compound wells define a baseline distribution. Every well in an outer column of that group is then
     replaced by the baseline value at the same percentile among that column's wells (rank-preserving), controls
-    included. A group with fewer than ``min_interior_wells`` interior compound wells, or an outer column with fewer than
-    ``min_outer_wells`` wells, is left unchanged.
+    included. An outer column with no wells (an empty column, dropped when pooling) is skipped; a layout with fewer than
+    `MIN_WELLS` interior compound wells, or an outer column with only one well, is an error.
     """
     features = list(features)
     if layout is None:
@@ -333,13 +395,15 @@ def match_outer_columns(
     for g in pd.unique(group):
         in_group = group == g
         base_rows = in_group & compound_mask & interior
-        if base_rows.sum() < min_interior_wells:
-            continue
+        if base_rows.sum() < MIN_WELLS:
+            raise ValueError(f"layout {g}: {int(base_rows.sum())} interior compound wells; need at least {MIN_WELLS} to define the baseline")
         baseline_sorted = np.sort(X[base_rows], axis=0)
         for c in outer_columns:
             rows = in_group & (col == c)
-            if rows.sum() < min_outer_wells:
+            if rows.sum() == 0:
                 continue
+            if rows.sum() < MIN_WELLS:
+                raise ValueError(f"layout {g}: {int(rows.sum())} wells in outer column {c}; need at least {MIN_WELLS} to match it")
             for j in range(X.shape[1]):
                 X[rows, j] = _quantile_match_1d(X[rows, j], baseline_sorted[:, j])
     out = profiles.copy()

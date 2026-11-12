@@ -1,7 +1,9 @@
-# SK-N-AS_repo1_screen: everything that differs between screens in the bulk-profile steps (read by utils/bulk_pipeline.py: load_config).
-# Every key is required. Relative paths are relative to this folder (3.process_features).
+# SK-N-AS: everything that differs between screens in the bulk-profile steps (read by utils/bulk_pipeline.py: load_config).
+# Every key is required. Relative paths are relative to this folder (3.process_features). The plate layout (which columns hold
+# controls and compounds) is not here: it is read from the platemaps.
 
 # ---- the screen ----
+cell_line: SK-N-AS
 screen_name: SK-N-AS_repo1_screen                 # prefixes every saved table
 profiles_dir: ~/mnt/bandicoot/PCCMA_data/SK-N-AS_repo1_profiles
 # profiles_dir is the screen's folder on the bandicoot mount: well cell counts, the pooled bulk profiles and the correction tables
@@ -29,20 +31,3 @@ bulk_dir: data/bulk_profiles
 annotated_subdir: annotated_profiles     # under profiles_dir
 annotated_glob: "*_annotated.parquet"
 per_plate_glob: "*_bulk_aggregated.parquet"
-
-# ---- the plate layout ----
-# 384-well plate: 16 rows. DMSO sits in columns 2 and 24 and compounds in columns 3-22; columns 1 and 23 are empty.
-plate_rows: 16
-control_columns: [2, 24]
-interior_columns: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
-outer_columns: [1, 2, 23, 24]     # matched to the interior columns' distribution (step E3)
-empty_well_query: 'Metadata_Batch_Id.isna() and Metadata_Solvent.isna()'          # dropped when pooling
-negative_control_query: 'Metadata_Batch_Id.isna() and Metadata_Solvent == "DMSO"'   # every plate is normalized on these wells
-
-# ---- thresholds ----
-thresholds:
-  min_abs_coef_var: 0.001      # variant filter: |MAD / median| of the controls must exceed this on every plate
-  correlation_threshold: 0.9   # feature selection: drop one of two features correlated above this
-  min_control_wells: 5         # align the control columns: at least this many controls per column per plate
-  min_interior_wells: 20       # match the outer columns: at least this many interior compound wells per layout
-  min_outer_wells: 5           # ... and at least this many wells in the outer column

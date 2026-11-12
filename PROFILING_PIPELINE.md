@@ -3,29 +3,34 @@
 Starts from single cells that passed cell-level QC (coSMicQC). No plate filtering. Written from the code in
 `utils/bulk_pipeline.py`, `utils/bulk_utils.py`, `utils/single_cell_utils.py` and the notebooks `2.bulk_profiles`, `4b` and `5b`; each
 has a `nbconverted/*.py` twin that `run_pipeline.sh` calls (generated from `utils/_build/*_template.py`). The bulk steps (numbered
-2, 3, 3a and 3b below) are the four steps `annotate`, `aggregate`, `counts` and `pool` of the one notebook `2.bulk_profiles`, which
-is the same for every screen: the code is in `bulk_pipeline.py` and what differs between screens is in each screen's
-`screen_config.yaml` (next section).
+2, 3, 3a and 3b below) are the steps `annotate`, `aggregate`, `counts`, and `pool`, `correct`, `normalize` of the one notebook
+`2.bulk_profiles`, which is the same for every screen except for its title (the cell line): the code is in `bulk_pipeline.py` and
+what differs between screens is in each screen's `screen_config.yaml` (next section).
 
 ## Configuration: `screen_config.yaml`
 
-One file per screen, in its `3.process_features` folder, holds everything that differs between screens; `bulk_pipeline.load_config`
-reads it and rejects missing or unknown keys. It has five groups of keys:
+One file per screen, in its `3.process_features` folder, holds what differs between screens; `bulk_pipeline.load_config` reads it
+and rejects missing or unknown keys. It has three groups of keys:
 
 | Group | Keys |
 |---|---|
-| the screen | `screen_name` (prefixes every saved table), `profiles_dir` (the screen's folder on the mount; `PROFILES_DIR` overrides it) |
+| the screen | `cell_line`, `screen_name` (prefixes every saved table), `profiles_dir` (the screen's folder on the mount; `PROFILES_DIR` overrides it) |
 | inputs | `raw_profile_dirs` (candidate folders; the first that exists is used), `raw_profile_suffix`, `platemap_dir`, `barcode_platemap_file`, `platemap_columns`, `platemap_rename`, `annotate_join_on`, `nuclei_location_columns` |
 | per-plate outputs | `qc_dir`, `annotated_dir`, `bulk_dir`, `annotated_subdir`, `annotated_glob`, `per_plate_glob` |
-| plate layout | `plate_rows`, `control_columns`, `interior_columns`, `outer_columns`, `empty_well_query`, `negative_control_query` |
-| thresholds | `min_abs_coef_var`, `correlation_threshold`, `min_control_wells`, `min_interior_wells`, `min_outer_wells` |
 
-A new screen needs a new `screen_config.yaml` (and the same notebook), not new code. The plate layout keys are what a screen with a
-different plate or control design changes. Settings that are not in the file (the cell-count winsorizing, bootstrap and backfitting
-counts, the frequency-filter cut-offs) are the parameters of the functions in `bulk_utils.py`, with the values listed below.
+A new screen needs a new `screen_config.yaml` (and the same notebook with its title), not new code.
 
-Rule: **correct, then normalize, then (bulk only) rank-transform, then select features.** Corrections remove one named
-artifact each and are constants per well, so they apply identically to a well's median and to every cell in it.
+**The plate layout is not configured; it is read from the platemaps** (`bulk_utils.design_from_platemaps`). A well with a batch ID
+is a compound well; a well with no batch ID but a solvent is a control well; a well with neither is empty. The interior columns are the
+columns that have compound wells, the control columns are the ones that have control wells, every other column is an outer column,
+and the number of rows comes from the well names. The step stops if the platemaps disagree about the control columns, if a control
+column also holds compounds, or if the compound columns are not consecutive (the column-wise corrections below need controls kept
+apart from compounds). For both screens this gives 16 rows, control columns 2 and 24, interior columns 3-22, outer columns 1, 2, 23, 24.
+
+**There are no thresholds in the file.** The variant filter (`min_abs_coef_var` 1e-3), the correlation filter (0.9), the cell-count
+winsorizing, the bootstrap and backfitting counts and the frequency-filter cut-offs are parameters of the functions in `bulk_utils.py`,
+with the values listed below; they are the same for every screen. A group of wells too small to define a distribution (fewer than
+`MIN_WELLS` = 2) is an error, not a silent skip.
 
 ## Facts about the plates (after empty wells are dropped)
 
@@ -58,7 +63,7 @@ Large files are written to local scratch, copied, and accepted only if a checksu
 | 2 | `2.bulk_profiles` `STEPS=annotate` | plate | profiles, QC flags, platemap | `<plate>_annotated.parquet` (poor-quality cells dropped) |
 | 3 | `2.bulk_profiles` `STEPS=aggregate` | plate | annotated cells | `<plate>_bulk_aggregated.parquet` |
 | 3a | `2.bulk_profiles` `STEPS=counts` | screen | annotated cells (plate, well columns) | counts csv |
-| 3b | `2.bulk_profiles` `STEPS=pool` | screen | per-plate aggregates, counts, platemap files | bulk profiles (corrected, base), correction tables |
+| 3b | `2.bulk_profiles` `STEPS=pool,correct,normalize` | screen | per-plate aggregates, counts, platemap files | bulk profiles (corrected, base), correction tables |
 | 4b-stats | `4b.single_cell_correct` `STAGE=stats` | plate | annotated cells (all variant features), tables | statistics pickle (no cells) |
 | 5b | `5b.single_cell_feature_select` | screen | all plates' statistics | selected-features JSON |
 | 4b-apply | `4b.single_cell_correct` `STAGE=apply` | plate | annotated cells (selected features), tables, list | corrected single cells |
@@ -69,19 +74,22 @@ filter; the corrections and the control-based variant filter have no pycytominer
 
 ## 3b: bulk profiles and tables
 
+The notebook runs this as three steps that hand the data to each other in memory: `pool` (steps 1-2), `correct` (steps 3-8; writes the
+shift, effect and amplitude tables) and `normalize` (steps 9-11; writes the bulk profiles, plate scales and feature lists).
+
 | # | Step (function) | Parameters | Hands on |
 |---|---|---|---|
 | 1 | Pool; drop empty wells; read layouts (`pool_plate_profiles`, `drop_wells`, `layouts_from_platemaps`) | empty = no compound and no solvent | wells x features; layout per plate |
 | 2 | Drop non-finite features | NaN/inf in any well | `original` values kept |
-| 3 | E3a align DMSO columns (`align_control_columns`) | `control_columns` (2, 24); at least `min_control_wells` (5) controls per column per plate; rank-preserving map onto the plate's pooled controls | aligned values |
-| 4 | E3 match to interior (`match_outer_columns`) | per layout; baseline = layout's compound wells in `interior_columns` (3-22); `outer_columns` (1, 2, 23, 24); at least `min_interior_wells` (20) interior, `min_outer_wells` (5) outer wells | matched values; `shift = matched - original` |
-| 5 | Variant filter (`plate_control_stats`, `variant_features`) | control MAD not 0 and abs(MAD/median) > `min_abs_coef_var` (1e-3) on every plate | variant features |
+| 3 | E3a align DMSO columns (`align_control_columns`) | the control columns (2, 24); at least 2 controls per column per plate; rank-preserving map onto the plate's pooled controls | aligned values |
+| 4 | E3 match to interior (`match_outer_columns`) | per layout; baseline = layout's compound wells in the interior columns (3-22); outer columns 1, 2, 23, 24 (columns with no wells are skipped) | matched values; `shift = matched - original` |
+| 5 | Variant filter (`plate_control_stats`, `variant_features`) | control MAD not 0 and abs(MAD/median) > 1e-3 on every plate | variant features |
 | 6 | Provisional scale (`plate_scale`, `apply_plate_scale`) | per plate: (x - control median) / (1.4826 x control MAD) | values for step 7 only |
 | 7 | Effects (`estimate_effects`) | below | `density`, `position`, amplitudes |
 | 8 | Subtract effects, original units | `effects = (density + position) x provisional plate scale` | corrected values |
 | 9 | Normalize | per plate: (x - median) / (1.4826 x MAD) of the **corrected** controls | normalized wells; final plate scale |
 | 10 | Inverse normal transform (`inverse_normal_transform`) | pycytominer `inverse_normal`, all wells, seed 0 | transformed wells |
-| 11 | Feature selection (`select_features`) | frequency (freq_cut 0.05, unique_cut 0.01), correlation `correlation_threshold` (0.9), blocklist, drop NaN | bulk profiles |
+| 11 | Feature selection (`select_features`) | frequency (freq_cut 0.05, unique_cut 0.01), correlation 0.9, blocklist, drop NaN | bulk profiles |
 
 The base set skips steps 7-8.
 

@@ -56,7 +56,7 @@ if [ $? -ne 0 ]; then
     failed_steps+=("aggregate")
 fi
 
-# Steps after this need the whole-screen tables from the counts and pool steps (STEPS=counts, then STEPS=pool), so they are
+# Steps after this need the whole-screen tables from the counts and pool steps (STEPS=counts, then STEPS=pool,correct,normalize), so they are
 # not run here. Once every plate's aggregate is in, run those two once, then submit
 # run_single_cell_hpc_child.sh per plate with STAGE=stats, run 5b.single_cell_feature_select once, and submit it
 # again per plate with STAGE=apply.

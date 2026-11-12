@@ -1,13 +1,17 @@
 """Bulk-profile processing steps shared by every screen.
 
-A screen is described once, in its `screen_config.yaml` (loaded by `load_config` into a `ScreenConfig`): paths, platemap
-columns, the plate layout (which columns hold the controls and the compounds) and the thresholds. The notebook
-`2.bulk_profiles` loads that file and calls the four steps below, so a new screen needs a YAML file, not new code:
+A screen is described once, in its `screen_config.yaml` (loaded by `load_config` into a `ScreenConfig`): the cell line, paths
+and platemap column names. The plate layout (which columns hold the controls and the compounds) is read from the platemaps
+themselves. The notebook `2.bulk_profiles` loads the file and calls the steps below, so a new screen needs a YAML file, not new code:
 
     annotate_plates(config)             annotate   per plate: platemap and QC flags attached, poor-quality cells dropped
     aggregate_plates(config)            aggregate  per plate: the median of the cells in each well
     count_cells_per_well(config)        counts     whole screen: cells per well (the cell-count covariate)
-    run_pooled_bulk_processing(config)  pool       whole screen: corrections, normalization, selection (see bulk_utils)
+    pool_plates(config)                 pool       whole screen: all plates in one table, empty wells and bad features dropped
+    correct(config, pooled)             correct    whole screen: the control columns aligned and matched, the cell-count and
+                                                   position effects subtracted; writes the correction tables
+    normalize(config, corrected)        normalize  whole screen: plate scaling on the corrected controls, inverse normal
+                                                   transform, feature selection; writes the bulk profiles
 
 The per-plate steps read PLATE_ID (process one plate per run, which keeps memory down) and OVERWRITE from the environment.
 """
@@ -45,6 +49,7 @@ class ScreenConfig:
     """
 
     # the screen
+    cell_line: str                        # e.g. "CHP-134"
     screen_name: str                      # e.g. "CHP-134_repo1_screen"; prefixes every saved table
     profiles_dir: str                     # the screen's profiles folder on bandicoot (PROFILES_DIR overrides): counts and pool read and write here
     # inputs
@@ -63,14 +68,6 @@ class ScreenConfig:
     annotated_subdir: str                 # under profiles_dir: where counts looks for the annotated profiles
     annotated_glob: str
     per_plate_glob: str                   # the per-plate aggregates that pool reads
-    # the plate layout
-    plate_rows: int                       # rows of the plate (16 for a 384-well plate, 8 for a 96-well plate)
-    control_columns: tuple                # columns that hold the negative controls (and no compounds)
-    interior_columns: tuple               # columns that hold compounds; their wells are the baseline for the control columns
-    outer_columns: tuple                  # columns matched to the interior ones (the control columns and the empty edge columns)
-    empty_well_query: str                 # pandas query: wells with neither compound nor solvent, dropped when pooling
-    negative_control_query: str           # pandas query: the negative-control wells every plate is normalized on
-    thresholds: dict                      # min_abs_coef_var, correlation_threshold, min_control_wells, min_interior_wells, min_outer_wells
 
     @property
     def raw_profile_dir(self) -> pathlib.Path:
@@ -80,9 +77,7 @@ class ScreenConfig:
 
 
 _PATH_FIELDS = ("platemap_dir", "qc_dir", "annotated_dir", "bulk_dir")
-_TUPLE_FIELDS = ("raw_profile_dirs", "platemap_columns", "annotate_join_on", "nuclei_location_columns",
-                 "control_columns", "interior_columns", "outer_columns")
-_THRESHOLDS = ("min_abs_coef_var", "correlation_threshold", "min_control_wells", "min_interior_wells", "min_outer_wells")
+_TUPLE_FIELDS = ("raw_profile_dirs", "platemap_columns", "annotate_join_on", "nuclei_location_columns")
 
 
 def config_from_dict(raw: dict) -> ScreenConfig:
@@ -99,11 +94,6 @@ def config_from_dict(raw: dict) -> ScreenConfig:
     values["raw_profile_dirs"] = tuple(pathlib.Path(d) for d in values["raw_profile_dirs"])
     if not values["raw_profile_dirs"]:
         raise ValueError("screen configuration: raw_profile_dirs is empty")
-    if set(values["thresholds"]) != set(_THRESHOLDS):
-        raise ValueError(f"screen configuration: thresholds must be exactly {list(_THRESHOLDS)}, got {sorted(values['thresholds'])}")
-    interior = values["interior_columns"]
-    if list(interior) != list(range(min(interior), max(interior) + 1)):
-        raise ValueError(f"screen configuration: interior_columns must be consecutive, got {list(interior)}")
     return ScreenConfig(**values)
 
 
@@ -316,158 +306,216 @@ def count_cells_per_well(config: ScreenConfig) -> pathlib.Path:
     return output_file
 
 
-# ---- whole screen: pool ----
-def run_pooled_bulk_processing(config: ScreenConfig) -> None:
-    """Pool the plates and run the corrections, normalization, rank transform and feature selection (see bulk_utils).
+# ---- whole screen: pool, correct, normalize ----
+# The three steps hand the data to each other in memory: the saved correction tables are float32, so reading them back
+# would change the numbers slightly. `run_pooled_bulk_processing` runs all three.
+@dataclass
+class PooledProfiles:
+    """What `pool_plates` returns: one row per well of every plate, before any correction."""
 
-    Reads the per-plate aggregates and the cell counts from, and writes the bulk profiles and the correction tables to,
-    the screen's profiles folder (PROFILES_DIR overrides it). The per-plate aggregates are read from `BULK_PROFILES_DIR` if set,
-    else from the aggregate step's output folder if it has any, else from the screen's folder on the mount.
-    Stops if a plate listed in the screen's barcode_platemap.csv has no per-plate file, unless `ALLOW_PARTIAL` is set.
+    profiles: pd.DataFrame            # metadata and feature columns
+    features: list                    # the features that are finite in every well
+    original: np.ndarray              # their values as aggregated (wells x features), for the per-well shift
+    layout: np.ndarray                # the plate layout of every well
+    layout_by_plate: pd.Series
+    design: bulk_utils.PlateDesign    # control, interior and outer columns, read from the platemaps
+
+
+@dataclass
+class CorrectedProfiles:
+    """What `correct` returns: the wells in original units after the corrections, and the provisional scale they were estimated on."""
+
+    profiles: pd.DataFrame            # metadata and the variant features
+    features: list                    # the variant features (every feature that varies in the controls of every plate)
+    matched: np.ndarray               # values after the control columns were aligned and matched (steps 3-4): the base set
+    corrected: np.ndarray             # values after the cell-count and position effects were subtracted (step 8)
+    provisional: np.ndarray           # `matched` on the provisional plate scale
+    provisional_scale: pd.DataFrame
+    layout_by_plate: pd.Series
+
+
+def _output_dir(config: ScreenConfig) -> pathlib.Path:
+    """Where the whole-screen steps read the cell counts from and write to: <profiles_dir>/bulk_profiles."""
+    return pathlib.Path(os.environ.get("PROFILES_DIR", config.profiles_dir)).expanduser() / "bulk_profiles"
+
+
+def _report(step: str, profiles: pd.DataFrame, features: list) -> None:
+    n_controls = int(bulk_utils.control_mask(profiles, bulk_utils.NEGATIVE_CONTROL_QUERY).sum())
+    print(f"{step}: {len(profiles)} wells ({n_controls} controls) on {profiles[PLATE_COLUMN].nunique()} plates, {len(features)} features")
+
+
+def _with_values(frame: pd.DataFrame, features: list, values: np.ndarray) -> pd.DataFrame:
+    """The frame's metadata columns plus ``values`` (n wells x n features) as the feature columns."""
+    meta = [c for c in frame.columns if c not in set(infer_cp_features(frame))]
+    return pd.concat([frame[meta].reset_index(drop=True), pd.DataFrame(values, columns=features)], axis=1)
+
+
+def _plate_key(plates: pd.Series) -> pd.Series:
+    """Plate names with spaces replaced by underscores (the pooled table does the same to the per-plate files' names)."""
+    return plates.astype(str).str.replace(" ", "_")
+
+
+def pool_plates(config: ScreenConfig) -> PooledProfiles:
+    """Step 1-2: pool the per-plate aggregates, drop empty wells and the features that are missing or infinite anywhere.
+
+    The per-plate aggregates are read from `BULK_PROFILES_DIR` if set, else from the aggregate step's output folder if it has
+    any, else from the screen's folder on the mount. Stops if a plate listed in the screen's barcode-to-platemap file has no
+    per-plate file, unless `ALLOW_PARTIAL` is set. The plate design (which columns hold the controls and the compounds) is
+    read from the platemaps.
     """
-    screen_name = config.screen_name
-    profiles_dir = pathlib.Path(os.environ.get("PROFILES_DIR", config.profiles_dir)).expanduser()
-    bulk_dir = profiles_dir / "bulk_profiles"
-    cell_count_file = bulk_dir / f"{screen_name}_well_cell_counts.csv"                                        # from 3a
-    output_file = bulk_dir / f"{screen_name}_pooled_bulk_corrected_feature_selected.parquet"                  # corrected set (main)
-    base_output_file = bulk_dir / f"{screen_name}_pooled_bulk_base_feature_selected.parquet"                  # without steps 7-8
-    tables_dir = bulk_dir                                                                                      # correction tables
-    min_abs_coef_var = config.thresholds["min_abs_coef_var"]
-    correlation_threshold = config.thresholds["correlation_threshold"]
-    neg_control_query = config.negative_control_query
-    interior = config.interior_columns
-    barcode_platemap_file = pathlib.Path(config.platemap_dir) / config.barcode_platemap_file
-
-    aggregate_dir = _input_dir("BULK_PROFILES_DIR", config.bulk_dir, bulk_dir, config.per_plate_glob)
+    platemap_dir = pathlib.Path(config.platemap_dir)
+    barcode_platemap_file = platemap_dir / config.barcode_platemap_file
+    aggregate_dir = _input_dir("BULK_PROFILES_DIR", config.bulk_dir, _output_dir(config), config.per_plate_glob)
     plate_files = sorted(aggregate_dir.glob(config.per_plate_glob))
     if not plate_files:
         raise FileNotFoundError(f"no per-plate profile files matching {config.per_plate_glob} in {aggregate_dir}")
-    print(f"Reading {len(plate_files)} per-plate profiles from {plate_files[0].parent}")
+    print(f"{config.cell_line}: reading {len(plate_files)} per-plate profiles from {plate_files[0].parent}")
 
-    def report(step, profiles, features):
-        n_controls = int(bulk_utils.control_mask(profiles, neg_control_query).sum())
-        print(f"{step}: {len(profiles)} wells ({n_controls} controls) on {profiles[PLATE_COLUMN].nunique()} plates, {len(features)} features")
-
-    def with_values(frame, features, values):
-        """The frame's metadata columns plus ``values`` (n wells x n features) as the feature columns."""
-        meta = [c for c in frame.columns if c not in set(infer_cp_features(frame))]
-        return pd.concat([frame[meta].reset_index(drop=True), pd.DataFrame(values, columns=features)], axis=1)
-
-    def plate_key(plates):
-        """Plate names with spaces replaced by underscores (the pooled table does the same to the per-plate files' names)."""
-        return plates.astype(str).str.replace(" ", "_")
-
-    # step 1: pool the plates, drop empty wells, read each plate's layout from the platemap files
-    layout_by_plate = bulk_utils.layouts_from_platemaps(barcode_platemap_file, pathlib.Path(config.platemap_dir))
+    layout_by_plate = bulk_utils.layouts_from_platemaps(barcode_platemap_file, platemap_dir)
+    design = bulk_utils.design_from_platemaps(barcode_platemap_file, platemap_dir)
+    print(f"plate design from the platemaps: {design}")
     pooled = bulk_utils.pool_plate_profiles(plate_files, PLATE_COLUMN)
     # every plate the platemap file lists must be here (ALLOW_PARTIAL=1 overrides, for a deliberate run on some plates)
     bulk_utils.check_plate_set(pooled[PLATE_COLUMN].unique(), layout_by_plate.index, allow_partial=bool(os.environ.get("ALLOW_PARTIAL")))
-    pooled, n_untreated = bulk_utils.drop_wells(pooled, config.empty_well_query)
-    print(f"dropped {n_untreated} empty wells (no compound, no solvent)")
+    pooled, n_empty = bulk_utils.drop_wells(pooled, bulk_utils.EMPTY_WELL_QUERY)
+    print(f"dropped {n_empty} empty wells (no compound, no solvent)")
     assert not pooled.duplicated([PLATE_COLUMN, WELL_COLUMN]).any(), "a plate/well appears more than once"
     features = infer_cp_features(pooled)
-    report("1 pooled", pooled, features)
+    _report("1 pooled", pooled, features)
 
     missing_plates = sorted(set(pooled[PLATE_COLUMN]) - set(layout_by_plate.index))
     assert not missing_plates, f"plates without a platemap file in {barcode_platemap_file}: {missing_plates}"
     layout = pooled[PLATE_COLUMN].map(layout_by_plate).to_numpy()
     print(f"{pd.Series(layout).nunique()} layouts; plates per layout: {sorted(layout_by_plate.value_counts().tolist(), reverse=True)}")
 
-    # step 2: drop features with missing or infinite values
     pooled, features, nonfinite = bulk_utils.drop_nonfinite_features(pooled, features)
     print(f"dropped {len(nonfinite)} features with NaN/inf values; examples: {nonfinite[:5]}")
-    report("2 finite features", pooled, features)
+    _report("2 finite features", pooled, features)
     original = pooled[features].to_numpy(dtype=float).copy()   # values before any correction (for the per-well shift)
+    return PooledProfiles(pooled, features, original, layout, layout_by_plate, design)
 
-    # steps 3-4: line up the two DMSO columns (E3a), then match the DMSO columns to the interior compound wells (E3)
-    pooled = bulk_utils.align_control_columns(pooled, features, neg_control_query, PLATE_COLUMN, WELL_COLUMN,
-                                              columns=config.control_columns, min_wells=config.thresholds["min_control_wells"])
-    report("3 control columns aligned", pooled, features)
-    pooled = bulk_utils.match_outer_columns(pooled, features, PLATE_COLUMN, WELL_COLUMN, layout=layout,
-                                             interior_columns=interior, outer_columns=config.outer_columns,
-                                             min_interior_wells=config.thresholds["min_interior_wells"],
-                                             min_outer_wells=config.thresholds["min_outer_wells"])
-    shift = pooled[features].to_numpy(dtype=float) - original   # what steps 3-4 added to each well's median
-    report("4 matched to interior", pooled, features)
+
+def correct(config: ScreenConfig, pooled: PooledProfiles) -> CorrectedProfiles:
+    """Steps 3-8: line up and match the control columns, keep the variant features, and subtract the cell-count and position effects.
+
+    Writes the per-well shift (steps 3-4) and effects (step 8) and the layout amplitudes to the output folder (the
+    correction tables that `4b.single_cell_correct` applies to every cell). Reads the cell counts from there too.
+    """
+    out_dir = _output_dir(config)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    screen_name, design = config.screen_name, pooled.design
+    query = bulk_utils.NEGATIVE_CONTROL_QUERY
+    profiles, features, original, layout = pooled.profiles, list(pooled.features), pooled.original, pooled.layout
+
+    # steps 3-4: line up the control columns (E3a), then match them to the interior compound wells (E3)
+    profiles = bulk_utils.align_control_columns(profiles, features, query, PLATE_COLUMN, WELL_COLUMN, columns=design.control_columns)
+    _report("3 control columns aligned", profiles, features)
+    profiles = bulk_utils.match_outer_columns(profiles, features, PLATE_COLUMN, WELL_COLUMN, layout=layout,
+                                              interior_columns=design.interior_columns, outer_columns=design.outer_columns)
+    shift = profiles[features].to_numpy(dtype=float) - original   # what steps 3-4 added to each well's median
+    _report("4 matched to interior", profiles, features)
     print(f"wells changed by steps 3-4: {int((np.abs(shift).sum(axis=1) > 0).sum())}")
 
     # step 5: variant filter
-    is_control = bulk_utils.control_mask(pooled, neg_control_query)
-    stats = bulk_utils.plate_control_stats(pooled, features, is_control, PLATE_COLUMN)
-    features_kept, features_dropped = bulk_utils.variant_features(stats, min_abs_coef_var)
+    is_control = bulk_utils.control_mask(profiles, query)
+    stats = bulk_utils.plate_control_stats(profiles, features, is_control, PLATE_COLUMN)
+    features_kept, features_dropped = bulk_utils.variant_features(stats)
     print(f"dropped {len(features_dropped)} of {len(features)} features that do not vary in the DMSO wells of every plate")
     keep = [features.index(f) for f in features_kept]
-    pooled = pooled.drop(columns=features_dropped)
-    original, shift = original[:, keep], shift[:, keep]
+    profiles = profiles.drop(columns=features_dropped)
+    shift = shift[:, keep]
     features = features_kept
-    report("5 variant features", pooled, features)
+    _report("5 variant features", profiles, features)
 
     # step 6: provisional scaling (to estimate the effects on a common scale)
-    matched = pooled[features].to_numpy(dtype=float)
-    provisional_scale = bulk_utils.plate_scale(pooled, features, neg_control_query, PLATE_COLUMN)
-    provisional = bulk_utils.apply_plate_scale(matched, pooled[PLATE_COLUMN].to_numpy(), provisional_scale, features, PLATE_COLUMN)
+    matched = profiles[features].to_numpy(dtype=float)
+    provisional_scale = bulk_utils.plate_scale(profiles, features, query, PLATE_COLUMN)
+    provisional = bulk_utils.apply_plate_scale(matched, profiles[PLATE_COLUMN].to_numpy(), provisional_scale, features, PLATE_COLUMN)
     assert np.isfinite(provisional).all(), "non-finite values after provisional scaling"
 
     # step 7: the cell-count effect and the position map (one amplitude per layout)
-    counts = pd.read_csv(cell_count_file)
-    counts[PLATE_COLUMN] = plate_key(counts[PLATE_COLUMN])
+    counts = pd.read_csv(out_dir / f"{screen_name}_well_cell_counts.csv")   # from the counts step
+    counts[PLATE_COLUMN] = _plate_key(counts[PLATE_COLUMN])
     counts = counts.drop_duplicates([PLATE_COLUMN, WELL_COLUMN]).set_index([PLATE_COLUMN, WELL_COLUMN])["n_cells"]
-    idx = pd.MultiIndex.from_arrays([plate_key(pooled[PLATE_COLUMN]), pooled[WELL_COLUMN]])
+    idx = pd.MultiIndex.from_arrays([_plate_key(profiles[PLATE_COLUMN]), profiles[WELL_COLUMN]])
     n_cells = counts.reindex(idx).to_numpy(dtype=float)
     print(f"wells with a cell count: {int(np.isfinite(n_cells).sum())} of {len(n_cells)}")
     assert np.isfinite(n_cells).mean() > 0.99, "cell counts missing for more than 1% of wells"
     log_n = np.log(np.where(n_cells > 0, n_cells, np.nan))
-    density, position, layout, amplitudes = bulk_utils.estimate_effects(
-        with_values(pooled, features, provisional), features, log_n, neg_control_query, PLATE_COLUMN, WELL_COLUMN, layout=layout,
-        compound_columns=(min(interior), max(interior)), control_columns=config.control_columns, n_rows=config.plate_rows,
+    density, position, layout_labels, amplitudes = bulk_utils.estimate_effects(
+        _with_values(profiles, features, provisional), features, log_n, query, PLATE_COLUMN, WELL_COLUMN, layout=layout,
+        compound_columns=(min(design.interior_columns), max(design.interior_columns)), control_columns=design.control_columns,
+        n_rows=design.n_rows,
     )
     print(amplitudes.round(3).to_string(index=False))
-    print(f"layouts: {layout.nunique()}; wells with a density effect: {int((np.abs(density).sum(axis=1) > 0).sum())}; "
+    print(f"layouts: {layout_labels.nunique()}; wells with a density effect: {int((np.abs(density).sum(axis=1) > 0).sum())}; "
           f"with a position effect: {int((np.abs(position).sum(axis=1) > 0).sum())}")
 
     # step 8: subtract the effects, in original units
     scale_rows = (provisional_scale[provisional_scale["statistic"] == "scale"].set_index(PLATE_COLUMN)[features]
-                  .reindex(pooled[PLATE_COLUMN].to_numpy()).to_numpy())
+                  .reindex(profiles[PLATE_COLUMN].to_numpy()).to_numpy())
     effects = (density + position) * scale_rows
     corrected = matched - effects
     print(f"median |effect| / plate scale: {np.median(np.abs(density + position)):.4f}")
 
+    # the per-well shifts and effects, so the same constants can be applied to every cell
+    keys = profiles[[PLATE_COLUMN, WELL_COLUMN]].reset_index(drop=True)
+    pd.concat([keys, pd.DataFrame(shift.astype(np.float32), columns=features)], axis=1).to_parquet(
+        out_dir / f"{screen_name}_correction_well_shift.parquet", index=False)
+    pd.concat([keys, pd.DataFrame(effects.astype(np.float32), columns=features)], axis=1).to_parquet(
+        out_dir / f"{screen_name}_correction_well_effects.parquet", index=False)
+    amplitudes.to_csv(out_dir / f"{screen_name}_correction_layout_amplitudes.csv", index=False)
+    print(f"saved the correction tables (shift, effects, amplitudes) to {out_dir}")
+    return CorrectedProfiles(profiles, features, matched, corrected, provisional, provisional_scale, pooled.layout_by_plate)
+
+
+def normalize(config: ScreenConfig, corrected: CorrectedProfiles) -> None:
+    """Steps 9-11: normalize each plate on its corrected controls, rank-transform, select features, and write the bulk profiles.
+
+    Two profile sets are written: the corrected set (the main output) and a base set that skips the cell-count and position
+    effects. The per-plate centre and scale (the constants for single cells) and the feature lists are written beside them.
+    """
+    out_dir = _output_dir(config)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    screen_name, query = config.screen_name, bulk_utils.NEGATIVE_CONTROL_QUERY
+    profiles, features = corrected.profiles, corrected.features
+    output_file = out_dir / f"{screen_name}_pooled_bulk_corrected_feature_selected.parquet"   # corrected set (main)
+    base_output_file = out_dir / f"{screen_name}_pooled_bulk_base_feature_selected.parquet"   # without steps 7-8
+
     # step 9: normalize each plate on its (corrected) DMSO wells
-    final_scale = bulk_utils.plate_scale(with_values(pooled, features, corrected), features, neg_control_query, PLATE_COLUMN)
-    base_scale = provisional_scale
-    plates = pooled[PLATE_COLUMN].to_numpy()
-    normalized = bulk_utils.apply_plate_scale(corrected, plates, final_scale, features, PLATE_COLUMN)
-    base_normalized = provisional
+    final_scale = bulk_utils.plate_scale(_with_values(profiles, features, corrected.corrected), features, query, PLATE_COLUMN)
+    base_scale = corrected.provisional_scale
+    plates = profiles[PLATE_COLUMN].to_numpy()
+    normalized = bulk_utils.apply_plate_scale(corrected.corrected, plates, final_scale, features, PLATE_COLUMN)
+    base_normalized = corrected.provisional
     assert np.isfinite(normalized).all(), "non-finite values after normalization"
 
     # steps 10-11: inverse normal transform, feature selection
-    transformed = bulk_utils.inverse_normal_transform(with_values(pooled, features, normalized), features)
-    base_transformed = bulk_utils.inverse_normal_transform(with_values(pooled, features, base_normalized), features)
-    report("10 inverse normal", transformed, features)
-    selected = bulk_utils.select_features(transformed, features, correlation_threshold)
+    transformed = bulk_utils.inverse_normal_transform(_with_values(profiles, features, normalized), features)
+    base_transformed = bulk_utils.inverse_normal_transform(_with_values(profiles, features, base_normalized), features)
+    _report("10 inverse normal", transformed, features)
+    selected = bulk_utils.select_features(transformed, features)
     selected_features = infer_cp_features(selected)
-    base_selected = bulk_utils.select_features(base_transformed, features, correlation_threshold)
+    base_selected = bulk_utils.select_features(base_transformed, features)
     base_selected_features = infer_cp_features(base_selected)
-    report("11 feature selected (corrected)", selected, selected_features)
-    report("11 feature selected (base)", base_selected, base_selected_features)
+    _report("11 feature selected (corrected)", selected, selected_features)
+    _report("11 feature selected (base)", base_selected, base_selected_features)
     selected.to_parquet(output_file, index=False)
     base_selected.to_parquet(base_output_file, index=False)
     print(f"saved {output_file}\nsaved {base_output_file}")
 
-    # the per-well shifts and effects and the per-plate scales, so the same constants can be applied to every cell
-    keys = pooled[[PLATE_COLUMN, WELL_COLUMN]].reset_index(drop=True)
-    pd.concat([keys, pd.DataFrame(shift.astype(np.float32), columns=features)], axis=1).to_parquet(
-        tables_dir / f"{screen_name}_correction_well_shift.parquet", index=False)
-    pd.concat([keys, pd.DataFrame(effects.astype(np.float32), columns=features)], axis=1).to_parquet(
-        tables_dir / f"{screen_name}_correction_well_effects.parquet", index=False)
-    final_scale.to_parquet(tables_dir / f"{screen_name}_correction_plate_scale_corrected.parquet", index=False)
-    base_scale.to_parquet(tables_dir / f"{screen_name}_correction_plate_scale_base.parquet", index=False)
-    (tables_dir / f"{screen_name}_correction_features.json").write_text(json.dumps({
+    final_scale.to_parquet(out_dir / f"{screen_name}_correction_plate_scale_corrected.parquet", index=False)
+    base_scale.to_parquet(out_dir / f"{screen_name}_correction_plate_scale_base.parquet", index=False)
+    (out_dir / f"{screen_name}_correction_features.json").write_text(json.dumps({
         "variant_features": features,
         "selected_bulk_corrected": selected_features,
         "selected_bulk_base": base_selected_features,
-        "plate_layout": layout_by_plate.to_dict(),
-        "control_query": neg_control_query,
+        "plate_layout": corrected.layout_by_plate.to_dict(),
+        "control_query": query,
     }, indent=1))
-    amplitudes.to_csv(tables_dir / f"{screen_name}_correction_layout_amplitudes.csv", index=False)
-    print(f"saved correction tables to {tables_dir}")
+    print(f"saved the plate scales and feature lists to {out_dir}")
+
+
+def run_pooled_bulk_processing(config: ScreenConfig) -> None:
+    """Pool the plates, correct them and normalize them: `pool_plates`, `correct` and `normalize` in one go."""
+    normalize(config, correct(config, pool_plates(config)))

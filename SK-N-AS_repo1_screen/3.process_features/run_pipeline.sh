@@ -5,7 +5,7 @@
 #   2.bulk_profiles.ipynb STEPS=annotate  -> one annotated, QC-passed single-cell profile per plate
 #   2.bulk_profiles.ipynb STEPS=aggregate -> per-plate aggregated (un-normalized) bulk profiles
 #   2.bulk_profiles.ipynb STEPS=counts    -> cells per well (whole screen)
-#   2.bulk_profiles.ipynb STEPS=pool      -> whole-screen bulk profiles and the well/plate correction tables
+#   2.bulk_profiles.ipynb STEPS=pool,correct,normalize -> whole-screen bulk profiles and the well/plate correction tables
 #                         (the notebook runs all four steps top to bottom; screen_config.yaml describes the screen)
 #   4b.single_cell_correct.ipynb        -> STAGE=stats: statistics of every normalized single cell, per plate
 #   5b.single_cell_feature_select.ipynb -> single-cell features selected on all cells' statistics (whole screen)
@@ -216,7 +216,7 @@ fi
 # bandicoot mount (PROFILES_DIR overrides it). It always recomputes, overwriting its output.
 # -----------------------------
 echo "======================================"
-echo "Step 3b: 2.bulk_profiles.ipynb STEPS=pool (whole screen)"
+echo "Step 3b: 2.bulk_profiles.ipynb STEPS=pool,correct,normalize (whole screen)"
 echo "======================================"
 
 # A failed aggregation or cell count would make 3b process a partial screen (or stale counts) without saying so, and
@@ -234,7 +234,7 @@ if [ ${#blocking_failures[@]} -gt 0 ] && [ -z "${ALLOW_PARTIAL:-}" ]; then
     failed_plates+=("pooled_bulk_processing:skipped")
 else
     echo ">>> Running pooled bulk processing for the whole screen"
-    STEPS=pool python nbconverted/2.bulk_profiles.py
+    STEPS=pool,correct,normalize python nbconverted/2.bulk_profiles.py
     exit_code=$?
 
     if [ "$exit_code" -ne 0 ]; then
