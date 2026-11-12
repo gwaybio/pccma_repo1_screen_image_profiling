@@ -3,11 +3,11 @@
 # Run the full feature-processing pipeline, in order:
 #   0b.merge_profiles.ipynb             -> one merged parquet per plate
 #   1.single_cell_qc.ipynb              -> one QC-annotations parquet per plate (via papermill)
-#   2.bulk_profiles.ipynb STEPS=annotate  -> one annotated, QC-passed single-cell profile per plate
-#   2.bulk_profiles.ipynb STEPS=aggregate -> per-plate aggregated (un-normalized) bulk profiles
-#   2.bulk_profiles.ipynb STEPS=counts    -> cells per well (whole screen)
-#   2.bulk_profiles.ipynb STEPS=pool,correct,normalize -> whole-screen bulk profiles and the well/plate correction tables
-#                         (the notebook runs all four steps top to bottom; screen_config.yaml describes the screen)
+#   2.bulk_profiles_CHP134.ipynb STEPS=annotate  -> one annotated, QC-passed single-cell profile per plate
+#   2.bulk_profiles_CHP134.ipynb STEPS=aggregate -> per-plate aggregated (un-normalized) bulk profiles
+#   2.bulk_profiles_CHP134.ipynb STEPS=counts    -> cells per well (whole screen)
+#   2.bulk_profiles_CHP134.ipynb STEPS=pool,correct,normalize -> whole-screen bulk profiles and the well/plate correction tables
+#                         (the notebook runs all six steps top to bottom; screen_config_CHP134.yaml describes the screen)
 #   4b.single_cell_correct.ipynb        -> STAGE=stats: statistics of every normalized single cell, per plate
 #   5b.single_cell_feature_select.ipynb -> single-cell features selected on all cells' statistics (whole screen)
 #   4b.single_cell_correct.ipynb        -> STAGE=apply: corrected, normalized single cells per plate
@@ -123,7 +123,7 @@ done
 # Skips plates without QC, and already-annotated plates.
 # -----------------------------
 echo "======================================"
-echo "Step 2: 2.bulk_profiles.ipynb STEPS=annotate (one plate at a time)"
+echo "Step 2: 2.bulk_profiles_CHP134.ipynb STEPS=annotate (one plate at a time)"
 echo "======================================"
 
 for plate_id in "${plate_ids[@]}"; do
@@ -135,7 +135,7 @@ for plate_id in "${plate_ids[@]}"; do
     fi
 
     echo ">>> Annotating ${plate_id}"
-    STEPS=annotate PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/2.bulk_profiles.py
+    STEPS=annotate PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/2.bulk_profiles_CHP134.py
     exit_code=$?
 
     if [ "$exit_code" -ne 0 ]; then
@@ -151,7 +151,7 @@ done
 # QC, and already-processed plates)
 # -----------------------------
 echo "======================================"
-echo "Step 3: 2.bulk_profiles.ipynb STEPS=aggregate (one plate at a time)"
+echo "Step 3: 2.bulk_profiles_CHP134.ipynb STEPS=aggregate (one plate at a time)"
 echo "======================================"
 
 for plate_id in "${plate_ids[@]}"; do
@@ -163,7 +163,7 @@ for plate_id in "${plate_ids[@]}"; do
     fi
 
     echo ">>> Running aggregation for ${plate_id}"
-    STEPS=aggregate PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/2.bulk_profiles.py
+    STEPS=aggregate PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/2.bulk_profiles_CHP134.py
     exit_code=$?
 
     if [ "$exit_code" -ne 0 ]; then
@@ -181,11 +181,11 @@ done
 # <screen profiles>/bulk_profiles/<screen>_well_cell_counts.csv (on the bandicoot mount) are skipped.
 # -----------------------------
 echo "======================================"
-echo "Step 3a: 2.bulk_profiles.ipynb STEPS=counts (whole screen)"
+echo "Step 3a: 2.bulk_profiles_CHP134.ipynb STEPS=counts (whole screen)"
 echo "======================================"
 
 echo ">>> Counting cells per well for the whole screen"
-STEPS=counts OVERWRITE="$overwrite" python nbconverted/2.bulk_profiles.py
+STEPS=counts OVERWRITE="$overwrite" python nbconverted/2.bulk_profiles_CHP134.py
 exit_code=$?
 
 if [ "$exit_code" -ne 0 ]; then
@@ -198,7 +198,7 @@ fi
 # -----------------------------
 # Step 3b: pooled bulk processing (whole screen, run once). Pools every plate's
 # un-normalized aggregated profile (from step 3) and processes it in the order correct,
-# normalize, rank-transform, select (see 2.bulk_profiles.ipynb): drop NaN/inf
+# normalize, rank-transform, select (see 2.bulk_profiles_CHP134.ipynb): drop NaN/inf
 # features, line up and match the DMSO columns, per-plate variant filter, subtract the
 # cell-count and plate-position effects, MAD normalization per plate, inverse normal
 # transform, pooled feature selection. It reads the per-plate *_bulk_aggregated.parquet files
@@ -207,7 +207,7 @@ fi
 # bandicoot mount (PROFILES_DIR overrides it). It always recomputes, overwriting its output.
 # -----------------------------
 echo "======================================"
-echo "Step 3b: 2.bulk_profiles.ipynb STEPS=pool,correct,normalize (whole screen)"
+echo "Step 3b: 2.bulk_profiles_CHP134.ipynb STEPS=pool,correct,normalize (whole screen)"
 echo "======================================"
 
 # A failed aggregation or cell count would make 3b process a partial screen (or stale counts) without saying so, and
@@ -225,7 +225,7 @@ if [ ${#blocking_failures[@]} -gt 0 ] && [ -z "${ALLOW_PARTIAL:-}" ]; then
     failed_plates+=("pooled_bulk_processing:skipped")
 else
     echo ">>> Running pooled bulk processing for the whole screen"
-    STEPS=pool,correct,normalize python nbconverted/2.bulk_profiles.py
+    STEPS=pool,correct,normalize python nbconverted/2.bulk_profiles_CHP134.py
     exit_code=$?
 
     if [ "$exit_code" -ne 0 ]; then

@@ -1,8 +1,8 @@
 """Bulk-profile processing steps shared by every screen.
 
-A screen is described once, in its `screen_config.yaml` (loaded by `load_config` into a `ScreenConfig`): the cell line, paths
+A screen is described once, in its `screen_config_<cell line>.yaml` (loaded by `load_config` into a `ScreenConfig`): the cell line, paths
 and platemap column names. The plate layout (which columns hold the controls and the compounds) is read from the platemaps
-themselves. The notebook `2.bulk_profiles` loads the file and calls the steps below, so a new screen needs a YAML file, not new code:
+themselves. The notebook `2.bulk_profiles_<cell line>` loads the file and calls the steps below, so a new screen needs a YAML file, not new code:
 
     annotate_plates(config)             annotate   per plate: platemap and QC flags attached, poor-quality cells dropped
     aggregate_plates(config)            aggregate  per plate: the median of the cells in each well
@@ -33,7 +33,7 @@ from pycytominer import aggregate, annotate
 from pycytominer.cyto_utils import output
 from pycytominer.cyto_utils.features import infer_cp_features
 
-import bulk_utils
+from . import bulk_utils
 
 PLATE_COLUMN = "Metadata_Plate"
 WELL_COLUMN = "Metadata_Well"
@@ -42,7 +42,7 @@ PLATE_METADATA_PREFIX = "Metadata_"
 
 @dataclass(frozen=True)
 class ScreenConfig:
-    """Everything that differs between screens, read from the screen's `screen_config.yaml` (see `load_config`).
+    """Everything that differs between screens, read from the screen's `screen_config_<cell line>.yaml` (see `load_config`).
 
     Every field is required: the YAML file is the one place a screen is described. Relative paths are relative to the
     screen's `3.process_features` folder, where the notebook runs.
@@ -98,7 +98,7 @@ def config_from_dict(raw: dict) -> ScreenConfig:
 
 
 def load_config(path: str | pathlib.Path) -> ScreenConfig:
-    """Read a screen's `screen_config.yaml`."""
+    """Read a screen's `screen_config_<cell line>.yaml`."""
     return config_from_dict(yaml.safe_load(pathlib.Path(path).read_text()))
 
 
@@ -227,7 +227,7 @@ def aggregate_plate(config: ScreenConfig, plate_id: str, overwrite: bool = False
     """The median of the plate's cells in every well, with the platemap metadata that is constant within a well kept."""
     annotated_path = config.annotated_dir / f"{plate_id}_annotated.parquet"
     if not annotated_path.exists():
-        print(f"Skipping {plate_id}: not yet annotated (run the annotate step of 2.bulk_profiles.ipynb for this plate first)")
+        print(f"Skipping {plate_id}: not yet annotated (run the annotate step of the 2.bulk_profiles notebook for this plate first)")
         return None
     output_file = config.bulk_dir / f"{plate_id}_bulk_aggregated.parquet"
     if output_file.exists() and not overwrite:
@@ -395,12 +395,14 @@ def pool_plates(config: ScreenConfig) -> PooledProfiles:
     return PooledProfiles(pooled, features, original, layout, layout_by_plate, design)
 
 
-def correct(config: ScreenConfig, pooled: PooledProfiles) -> CorrectedProfiles:
+def correct(config: ScreenConfig, pooled: PooledProfiles | None) -> CorrectedProfiles:
     """Steps 3-8: line up and match the control columns, keep the variant features, and subtract the cell-count and position effects.
 
     Writes the per-well shift (steps 3-4) and effects (step 8) and the layout amplitudes to the output folder (the
     correction tables that `4b.single_cell_correct` applies to every cell). Reads the cell counts from there too.
     """
+    if pooled is None:
+        raise ValueError("`correct` needs the result of `pool_plates`: run the pool step in the same process (STEPS=pool,correct,normalize)")
     out_dir = _output_dir(config)
     out_dir.mkdir(parents=True, exist_ok=True)
     screen_name, design = config.screen_name, pooled.design
@@ -469,12 +471,14 @@ def correct(config: ScreenConfig, pooled: PooledProfiles) -> CorrectedProfiles:
     return CorrectedProfiles(profiles, features, matched, corrected, provisional, provisional_scale, pooled.layout_by_plate)
 
 
-def normalize(config: ScreenConfig, corrected: CorrectedProfiles) -> None:
+def normalize(config: ScreenConfig, corrected: CorrectedProfiles | None) -> None:
     """Steps 9-11: normalize each plate on its corrected controls, rank-transform, select features, and write the bulk profiles.
 
     Two profile sets are written: the corrected set (the main output) and a base set that skips the cell-count and position
     effects. The per-plate centre and scale (the constants for single cells) and the feature lists are written beside them.
     """
+    if corrected is None:
+        raise ValueError("`normalize` needs the result of `correct`: run the correct step in the same process (STEPS=pool,correct,normalize)")
     out_dir = _output_dir(config)
     out_dir.mkdir(parents=True, exist_ok=True)
     screen_name, query = config.screen_name, bulk_utils.NEGATIVE_CONTROL_QUERY

@@ -1,13 +1,13 @@
 # Image-based profiling pipeline (CHP-134 and SK-N-AS), as implemented
 
 Starts from single cells that passed cell-level QC (coSMicQC). No plate filtering. Written from the code in
-`utils/bulk_pipeline.py`, `utils/bulk_utils.py`, `utils/single_cell_utils.py` and the notebooks `2.bulk_profiles`, `4b` and `5b`; each
-has a `nbconverted/*.py` twin that `run_pipeline.sh` calls (generated from `utils/_build/*_template.py`). The bulk steps (numbered
+`utils/profiling/bulk_pipeline.py`, `utils/profiling/bulk_utils.py`, `utils/profiling/single_cell_utils.py` and the notebooks `2.bulk_profiles_<cell line>`, `4b` and `5b`; each
+has a `nbconverted/*.py` twin that `run_pipeline.sh` calls (made by `jupyter nbconvert`). The bulk steps (numbered
 2, 3, 3a and 3b below) are the steps `annotate`, `aggregate`, `counts`, and `pool`, `correct`, `normalize` of the one notebook
-`2.bulk_profiles`, which is the same for every screen except for its title (the cell line): the code is in `bulk_pipeline.py` and
-what differs between screens is in each screen's `screen_config.yaml` (next section).
+`2.bulk_profiles_<cell line>`, which is the same for every screen except for the cell line (its title and the configuration file it loads): the code is in `bulk_pipeline.py` and
+what differs between screens is in each screen's `screen_config_<cell line>.yaml` (next section).
 
-## Configuration: `screen_config.yaml`
+## Configuration: `screen_config_<cell line>.yaml`
 
 One file per screen, in its `3.process_features` folder, holds what differs between screens; `bulk_pipeline.load_config` reads it
 and rejects missing or unknown keys. It has three groups of keys:
@@ -18,7 +18,7 @@ and rejects missing or unknown keys. It has three groups of keys:
 | inputs | `raw_profile_dirs` (candidate folders; the first that exists is used), `raw_profile_suffix`, `platemap_dir`, `barcode_platemap_file`, `platemap_columns`, `platemap_rename`, `annotate_join_on`, `nuclei_location_columns` |
 | per-plate outputs | `qc_dir`, `annotated_dir`, `bulk_dir`, `annotated_subdir`, `annotated_glob`, `per_plate_glob` |
 
-A new screen needs a new `screen_config.yaml` (and the same notebook with its title), not new code.
+A new screen needs a new `screen_config_<cell line>.yaml` and a copy of the notebook for its cell line, not new code. (In file names the cell line has no dash: `CHP134`, `SKNAS`.)
 
 **The plate layout is not configured; it is read from the platemaps** (`bulk_utils.design_from_platemaps`). A well with a batch ID
 is a compound well; a well with no batch ID but a solvent is a control well; a well with neither is empty. The interior columns are the
@@ -42,7 +42,7 @@ file per plate, so layouts are read from the files' contents). Layouts come from
 
 uv, Python 3.12, `pyproject.toml` / `uv.lock` (pycytominer 1.7.1, pandas 2.3.3, numpy 2.3.5, scipy 1.18.1, scikit-learn 1.7.2,
 pyarrow 20). Create it with `uv sync`; `run_pipeline.sh` and `utils/run_full_profiling.sh` use `.venv`. Checks against
-pycytominer: `uv run python utils/test_profiling_utils.py` (bulk) and `uv run python utils/test_single_cell_utils.py` (single cells).
+pycytominer: `uv run pytest` (the tests are in `tests/`).
 
 ## Where things are written (bandicoot; existing files are never overwritten)
 
@@ -53,24 +53,24 @@ pycytominer: `uv run python utils/test_profiling_utils.py` (bulk) and `uv run py
 | `<screen profiles>/run_logs/` | status file and one log per step and plate |
 
 Large files are written to local scratch, copied, and accepted only if a checksum read back from the mount matches
-(`utils/io_utils.py`): a large direct write to the mount was once seen to lose 16 MiB regions silently.
+(`utils/profiling/io_utils.py`): a large direct write to the mount was once seen to lose 16 MiB regions silently.
 
 ## Run order (`utils/run_full_profiling.sh`)
 
 | Order | Step | Per | Reads | Writes |
 |---|---|---|---|---|
 | 1 | `1.single_cell_qc` | plate | cells | QC flags |
-| 2 | `2.bulk_profiles` `STEPS=annotate` | plate | profiles, QC flags, platemap | `<plate>_annotated.parquet` (poor-quality cells dropped) |
-| 3 | `2.bulk_profiles` `STEPS=aggregate` | plate | annotated cells | `<plate>_bulk_aggregated.parquet` |
-| 3a | `2.bulk_profiles` `STEPS=counts` | screen | annotated cells (plate, well columns) | counts csv |
-| 3b | `2.bulk_profiles` `STEPS=pool,correct,normalize` | screen | per-plate aggregates, counts, platemap files | bulk profiles (corrected, base), correction tables |
+| 2 | `2.bulk_profiles_<cell line>` `STEPS=annotate` | plate | profiles, QC flags, platemap | `<plate>_annotated.parquet` (poor-quality cells dropped) |
+| 3 | `2.bulk_profiles_<cell line>` `STEPS=aggregate` | plate | annotated cells | `<plate>_bulk_aggregated.parquet` |
+| 3a | `2.bulk_profiles_<cell line>` `STEPS=counts` | screen | annotated cells (plate, well columns) | counts csv |
+| 3b | `2.bulk_profiles_<cell line>` `STEPS=pool,correct,normalize` | screen | per-plate aggregates, counts, platemap files | bulk profiles (corrected, base), correction tables |
 | 4b-stats | `4b.single_cell_correct` `STAGE=stats` | plate | annotated cells (all variant features), tables | statistics pickle (no cells) |
 | 5b | `5b.single_cell_feature_select` | screen | all plates' statistics | selected-features JSON |
 | 4b-apply | `4b.single_cell_correct` `STAGE=apply` | plate | annotated cells (selected features), tables, list | corrected single cells |
 
 The per-plate single-cell steps run two plates at a time (`WORKERS`). Single cells are never rank-transformed and never
 sphered. pycytominer is used for plate scaling (`RobustMAD`), the inverse normal transform and every feature-selection
-filter; the corrections and the control-based variant filter have no pycytominer equivalent and are in `utils/bulk_utils.py`.
+filter; the corrections and the control-based variant filter have no pycytominer equivalent and are in `utils/profiling/bulk_utils.py`.
 
 ## 3b: bulk profiles and tables
 
@@ -128,8 +128,9 @@ duplicates, split over three "plates", this gives exactly the same features as `
 
 ## Checks
 
-- `utils/test_profiling_utils.py`: the plate scaling equals pycytominer's `mad_robustize` (to 1e-12).
-- `utils/test_single_cell_utils.py`: the streaming feature selection equals `pycytominer.feature_select` on the pooled cells.
+- `tests/test_bulk_utils.py`: the plate scaling equals pycytominer's `mad_robustize` (to 1e-12); the plate design is read correctly from both screens' platemaps and from a synthetic 96-well design; platemaps that cannot be described, a missing plate and a group of fewer than two wells are errors.
+- `tests/test_bulk_pipeline.py`: the screen configurations load and bad ones are rejected; `correct` and `normalize` say which step is missing.
+- `tests/test_single_cell_utils.py`: the streaming feature selection equals `pycytominer.feature_select` on the pooled cells.
 - 2026-10-23: CHP-134 annotate, aggregate, 3a and 3b rerun through `bulk_pipeline.py` reproduce the existing per-plate
   profiles, the corrected and base bulk profiles (9,400 wells) and the shift and effect tables exactly (maximum difference 0).
 - 2026-10-21: every stage of `utils/run_full_profiling.sh` finished for both screens with no missing or unreadable file

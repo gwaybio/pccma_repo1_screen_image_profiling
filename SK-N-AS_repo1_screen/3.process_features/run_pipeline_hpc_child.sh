@@ -41,16 +41,16 @@ else
 fi
 
 # Step 2: annotation
-STEPS=annotate PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/2.bulk_profiles.py
+STEPS=annotate PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/2.bulk_profiles_SKNAS.py
 if [ $? -ne 0 ]; then
     echo "Annotation FAILED for plate: $plate_id"
     failed_steps+=("annotate")
 fi
 
 # Step 3: aggregation (per-plate only -- the whole-screen steps that follow,
-# the counts and pool steps of 2.bulk_profiles.ipynb, are not run here; run
+# the counts and pool steps of 2.bulk_profiles_SKNAS.ipynb, are not run here; run
 # them once every plate's aggregated profile is in)
-STEPS=aggregate PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/2.bulk_profiles.py
+STEPS=aggregate PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/2.bulk_profiles_SKNAS.py
 if [ $? -ne 0 ]; then
     echo "Aggregation FAILED for plate: $plate_id"
     failed_steps+=("aggregate")

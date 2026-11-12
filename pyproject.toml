@@ -13,8 +13,8 @@ dependencies = [
     "scikit-learn==1.7.2",
     "pyarrow==20.0.0",
     "openpyxl>=3.1",
-    "pyyaml>=6",   # each screen's screen_config.yaml
-    # notebooks (generated from utils/_build templates by make_notebooks.py) and papermill-driven QC
+    "pyyaml>=6",   # each screen's screen_config_<cell line>.yaml
+    # notebooks and papermill-driven QC
     "nbformat>=5.10",
     "nbconvert>=7.16",
     "papermill>=2.6",
@@ -23,6 +23,7 @@ dependencies = [
 ]
 
 [dependency-groups]
+dev = ["pytest>=8"]
 # conversion and cell-level QC (steps 0-2)
 upstream = [
     "cytotable",
@@ -39,4 +40,8 @@ diagnostics = ["copairs>=0.5.4"]
 
 [tool.uv]
 package = false
-default-groups = ["upstream", "analysis", "diagnostics"]
+default-groups = ["dev", "upstream", "analysis", "diagnostics"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["utils", "tests"]   # `import profiling`; `from conftest import ...`
