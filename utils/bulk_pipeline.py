@@ -270,6 +270,7 @@ def run_pooled_bulk_processing(config: ScreenConfig) -> None:
     Reads the per-plate aggregates and the cell counts from, and writes the bulk profiles and the correction tables to,
     the screen's profiles folder (PROFILES_DIR overrides it). The per-plate aggregates are read from `BULK_PROFILES_DIR` if set,
     else from the aggregate step's output folder if it has any, else from the screen's folder on the mount.
+    Stops if a plate listed in the screen's barcode_platemap.csv has no per-plate file, unless `ALLOW_PARTIAL` is set.
     """
     screen_name = config.screen_name
     profiles_dir = pathlib.Path(os.environ.get("PROFILES_DIR", config.profiles_dir)).expanduser()
@@ -302,14 +303,16 @@ def run_pooled_bulk_processing(config: ScreenConfig) -> None:
         return plates.astype(str).str.replace(" ", "_")
 
     # step 1: pool the plates, drop empty wells, read each plate's layout from the platemap files
+    layout_by_plate = bulk_utils.layouts_from_platemaps(barcode_platemap_file, pathlib.Path(config.platemap_dir))
     pooled = bulk_utils.pool_plate_profiles(plate_files, PLATE_COLUMN)
+    # every plate the platemap file lists must be here (ALLOW_PARTIAL=1 overrides, for a deliberate run on some plates)
+    bulk_utils.check_plate_set(pooled[PLATE_COLUMN].unique(), layout_by_plate.index, allow_partial=bool(os.environ.get("ALLOW_PARTIAL")))
     pooled, n_untreated = bulk_utils.drop_wells(pooled, UNTREATED_QUERY)
     print(f"dropped {n_untreated} empty wells (no compound, no solvent)")
     assert not pooled.duplicated([PLATE_COLUMN, WELL_COLUMN]).any(), "a plate/well appears more than once"
     features = infer_cp_features(pooled)
     report("1 pooled", pooled, features)
 
-    layout_by_plate = bulk_utils.layouts_from_platemaps(barcode_platemap_file, pathlib.Path(config.platemap_dir))
     missing_plates = sorted(set(pooled[PLATE_COLUMN]) - set(layout_by_plate.index))
     assert not missing_plates, f"plates without a platemap file in {barcode_platemap_file}: {missing_plates}"
     layout = pooled[PLATE_COLUMN].map(layout_by_plate).to_numpy()

@@ -66,6 +66,9 @@ filter; the corrections and the control-based variant filter have no pycytominer
 
 The base set skips steps 7-8.
 
+3b stops if a plate listed in the screen's `barcode_platemap.csv` has no per-plate file, and `run_pipeline.sh` skips 3b when a
+plate's aggregation or the cell counts failed. `ALLOW_PARTIAL=1` overrides both, for a deliberate run on some plates (3b then warns).
+
 ### Step 7 (CFReT-style: shared models, one amplitude per layout)
 
 | Piece | Definition |

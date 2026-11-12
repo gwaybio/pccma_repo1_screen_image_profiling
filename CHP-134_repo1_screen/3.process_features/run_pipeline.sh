@@ -209,15 +209,30 @@ echo "======================================"
 echo "Step 3b: 3b.pooled_bulk_processing.ipynb (whole screen)"
 echo "======================================"
 
-echo ">>> Running pooled bulk processing for the whole screen"
-python nbconverted/3b.pooled_bulk_processing.py
-exit_code=$?
+# A failed aggregation or cell count would make 3b process a partial screen (or stale counts) without saying so, and
+# overwrite the earlier whole-screen files with it. Skip 3b unless ALLOW_PARTIAL is set (a deliberate partial run).
+blocking_failures=()
+for failure in ${failed_plates[@]+"${failed_plates[@]}"}; do
+    case "$failure" in
+        aggregate:*|well_cell_counts:*) blocking_failures+=("$failure") ;;
+    esac
+done
 
-if [ "$exit_code" -ne 0 ]; then
-    echo "Pooled bulk processing FAILED (exit code $exit_code)"
-    failed_plates+=("pooled_bulk_processing:whole_screen")
+if [ ${#blocking_failures[@]} -gt 0 ] && [ -z "${ALLOW_PARTIAL:-}" ]; then
+    echo "Skipping pooled bulk processing: earlier steps failed for ${blocking_failures[*]}"
+    echo "(fix them and rerun, or set ALLOW_PARTIAL=1 to process the plates that finished)"
+    failed_plates+=("pooled_bulk_processing:skipped")
 else
-    echo "Pooled bulk processing done for whole screen"
+    echo ">>> Running pooled bulk processing for the whole screen"
+    python nbconverted/3b.pooled_bulk_processing.py
+    exit_code=$?
+
+    if [ "$exit_code" -ne 0 ]; then
+        echo "Pooled bulk processing FAILED (exit code $exit_code)"
+        failed_plates+=("pooled_bulk_processing:whole_screen")
+    else
+        echo "Pooled bulk processing done for whole screen"
+    fi
 fi
 
 # -----------------------------

@@ -25,6 +25,22 @@ def test_plate_scale_equals_pycytominer_mad_robustize():
     assert np.allclose(mine, ref[feats].to_numpy(), atol=1e-12), "plate scaling differs from pycytominer"
 
 
+def test_check_plate_set_stops_on_missing_plate_unless_allowed():
+    import warnings
+    assert b.check_plate_set(["P1", "P2"], ["P1", "P2"]) == []
+    assert b.check_plate_set(["P1", "P2", "P3"], ["P1", "P2"]) == []   # extra plates are the pooled step's concern
+    try:
+        b.check_plate_set(["P1"], ["P1", "P2", "P3"])
+    except ValueError as error:
+        assert "P2" in str(error) and "P3" in str(error) and "ALLOW_PARTIAL" in str(error)
+    else:
+        raise AssertionError("a missing plate did not stop the run")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert b.check_plate_set(["P1"], ["P1", "P2"], allow_partial=True) == ["P2"]
+    assert any("ALLOW_PARTIAL" in str(w.message) for w in caught)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

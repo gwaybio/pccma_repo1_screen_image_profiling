@@ -63,6 +63,25 @@ def pool_plate_profiles(
     return pooled
 
 
+def check_plate_set(found: Iterable[str], expected: Iterable[str], allow_partial: bool = False) -> list[str]:
+    """Stop (or warn) if plates that should be pooled are missing; return the missing plates, sorted.
+
+    ``expected`` is every plate the screen's barcode-to-platemap file lists; ``found`` the plates that were pooled. Pooling
+    a subset silently changes every whole-screen estimate (normalization, effects, feature selection), so a missing plate
+    raises a ValueError unless ``allow_partial`` is set, in which case it only warns (a deliberate run on some plates).
+    Plates found but not expected are not checked here (the pooled step reports plates without a platemap).
+    """
+    missing = sorted(set(expected) - set(found))
+    if missing and not allow_partial:
+        raise ValueError(
+            f"{len(missing)} plates in the platemap file have no per-plate profile and would be left out of the pooled "
+            f"processing: {missing}. Fix their aggregation, or set ALLOW_PARTIAL=1 to process the plates found."
+        )
+    if missing:
+        warnings.warn(f"ALLOW_PARTIAL: processing without {len(missing)} plates: {missing}")
+    return missing
+
+
 def split_feature_columns(profiles: pd.DataFrame, features: Sequence[str]) -> list[str]:
     """The metadata columns: everything that is not one of ``features``, in their original order."""
     feature_set = set(features)
