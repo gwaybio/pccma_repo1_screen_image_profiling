@@ -1,8 +1,82 @@
 # %% [markdown]
-# # Pooled bulk processing, {SCREEN}
+# # Bulk profiles
 #
-# Turns the per-plate well profiles (the median of every feature over a well's quality-controlled cells) into the
-# screen's bulk profiles, using the order *correct, then normalize, then transform, then select*:
+# From each plate's quality-controlled single cells to the screen's bulk profiles. This notebook is the same in every screen:
+# what differs between screens (paths, platemap columns, the plate layout, thresholds) is in `screen_config.yaml` next to it,
+# and the code is in `utils/bulk_pipeline.py` (the steps) and `utils/bulk_utils.py` (the corrections). Run it top to bottom.
+#
+# | Step | What | Per | Writes |
+# |---|---|---|---|
+# | `annotate` | attach the platemap; drop the poor-quality segmentations (the flags of `1.single_cell_qc`) | plate | `data/annotated_profiles/<plate>_annotated.parquet` |
+# | `aggregate` | the median of each feature over the cells of every well; platemap columns constant within a well are kept | plate | `data/bulk_profiles/<plate>_bulk_aggregated.parquet` |
+# | `counts` | quality-controlled cells per well, the covariate of the cell-count effect | screen | `<screen>_well_cell_counts.csv` on the mount |
+# | `pool` | corrections, normalization, rank transform and feature selection over all plates (table below) | screen | the bulk profiles and the correction tables on the mount |
+#
+# Environment variables: `PLATE_ID` limits `annotate` and `aggregate` to one plate (`run_pipeline.sh` runs one process per plate,
+# which keeps memory down); `OVERWRITE=1` redoes finished plates; `STEPS` is a comma-separated subset of the four steps
+# (default: all); `PROFILES_DIR`, `ANNOTATED_DIR` and `BULK_PROFILES_DIR` override where the whole-screen steps read and write;
+# `ALLOW_PARTIAL=1` lets `pool` run without every plate. Existing per-plate outputs are skipped.
+
+# %% [markdown]
+# ## Configuration
+
+# %%
+import dataclasses
+import os
+import pprint
+import sys
+
+sys.path.append("../../utils")   # bulk_pipeline.py, shared by every screen
+
+import bulk_pipeline
+
+config = bulk_pipeline.load_config("screen_config.yaml")
+pprint.pprint(dataclasses.asdict(config), sort_dicts=False)
+
+# %%
+ALL_STEPS = ["annotate", "aggregate", "counts", "pool"]
+steps = [s for s in os.environ.get("STEPS", ",".join(ALL_STEPS)).split(",") if s]
+assert set(steps) <= set(ALL_STEPS), f"STEPS must be a subset of {ALL_STEPS}, got {steps}"
+print("running:", steps)
+
+# %% [markdown]
+# ## Per plate: annotate
+#
+# Attaches the platemap, drops the poor-quality segmentations (the per-cell flags from `1.single_cell_qc`) and writes one
+# annotated profile per plate. The cells are dropped before annotating, which keeps the memory use down.
+
+# %%
+if "annotate" in steps:
+    bulk_pipeline.annotate_plates(config)
+
+# %% [markdown]
+# ## Per plate: aggregate
+#
+# Aggregates each plate's annotated cells to one profile per well (the median of the cells). These per-plate, un-normalized
+# profiles are the input of `pool`, where the corrections, normalization and feature selection happen once over the whole screen.
+
+# %%
+if "aggregate" in steps:
+    bulk_pipeline.aggregate_plates(config)
+
+# %% [markdown]
+# ## Whole screen: cells per well
+#
+# Counts the quality-controlled single cells in every well. Only the plate and well columns of each annotated profile are
+# read, so this is fast. Plates already in the output are skipped. The annotated profiles are read from
+# `data/annotated_profiles` if it has any, else from the screen's folder on the bandicoot mount.
+
+# %%
+if "counts" in steps:
+    bulk_pipeline.count_cells_per_well(config)
+
+# %% [markdown]
+# ## Whole screen: pool and process
+#
+# Turns the per-plate well profiles into the screen's bulk profiles, using the order *correct, then normalize, then
+# transform, then select*. Two profile sets are written: the *corrected* set (steps 1-11; the main output) and a *base* set
+# that skips steps 7-8. The shifts (steps 3-4) and effects (steps 7-8) are saved per well, and the plate statistics per plate,
+# so that `4b.single_cell_correct` (next PR) applies exactly the same constants to every single cell. No plate is filtered out.
 #
 # | Step | What | Kind | Code |
 # |---|---|---|---|
@@ -17,39 +91,21 @@
 # | 9 | Normalize: centre each plate on its corrected DMSO median, divide by 1.4826 x MAD | normalization | `bulk_utils.plate_scale`, `apply_plate_scale` |
 # | 10 | Rank-based inverse normal transform over all wells (bulk only) | transform | `bulk_utils.inverse_normal_transform` |
 # | 11 | Feature selection: near-constant, near-duplicate (correlation 0.9), blocklisted, missing | selection | `bulk_utils.select_features` |
-#
-# Two profile sets are written: the *corrected* set (steps 1-11; the main output) and a *base* set that skips steps 7-8.
-# The shifts (steps 3-4) and effects (steps 7-8) are saved per well, and the plate statistics per plate, so that
-# `4b.single_cell_correct` applies exactly the same constants to every single cell. No plate is filtered out.
-#
-# The processing is `bulk_pipeline.run_pooled_bulk_processing` (using `bulk_utils`); the steps are explained below.
-# The per-plate aggregates are read from `data/bulk_profiles` (the output of `3.aggregate_bulk_profiles`) if it has any, else
-# from the screen's folder on the bandicoot mount; `BULK_PROFILES_DIR` overrides this. The cell counts are read from, and the
-# results written to, the mount (`PROFILES_DIR` overrides it).
-
-# %% [markdown]
-# ## Run
 
 # %%
-import sys
-
-sys.path.append("../../utils")   # bulk_pipeline.py, shared by every screen
-sys.path.append(".")             # this screen's screen_config.py
-
-import bulk_pipeline
-from screen_config import config
-
-# %%
-bulk_pipeline.run_pooled_bulk_processing(config)
+if "pool" in steps:
+    bulk_pipeline.run_pooled_bulk_processing(config)
 
 # %% [markdown]
 # ### Step 1: pool the plates
 #
 # One row per well, all plates stacked, with the values as aggregated (a per-well median of the quality-controlled single cells).
+# Every plate listed in the screen's barcode-to-platemap file must be there, or the step stops; `ALLOW_PARTIAL=1` makes it warn
+# and process the plates found (for a deliberate run on some plates).
 #
 # ### Step 3: line up the two DMSO columns of every plate (E3a)
 #
-# DMSO sits in columns 2 and 24 of every plate. Both hold the same substance, so within a plate they should be
+# In these screens DMSO sits in columns 2 and 24 of every plate (`control_columns`). Both hold the same substance, so within a plate they should be
 # interchangeable, but each plate's column 2 differs from its column 24 by a stable, plate-specific offset (it holds
 # across rows and changes sign between plates, so no single correction for the screen can remove it). Within each plate
 # and for each feature, the DMSO wells of both columns are reshaped, keeping their order, to follow the plate's pooled
@@ -57,8 +113,9 @@ bulk_pipeline.run_pooled_bulk_processing(config)
 #
 # ### Step 4: match the DMSO columns to the interior compound wells (E3)
 #
-# For each layout and each feature, the DMSO wells in the outer columns
-# (2 and 24) are reshaped, keeping their order, to the distribution of that layout's compound wells in columns 3-22.
+# For each layout and each feature, the DMSO wells in the outer columns (`outer_columns`; 2 and 24 here, the empty
+# columns 1 and 23 are not DMSO) are reshaped, keeping their order, to the distribution of that layout's compound wells in
+# the interior columns (`interior_columns`; 3-22 here).
 # This is done on the original, unscaled values. It makes the outer-column DMSO wells representative of the interior.
 #
 # ### Step 5: variant filter
@@ -76,7 +133,7 @@ bulk_pipeline.run_pooled_bulk_processing(config)
 # * **Cell count.** In DMSO wells, the part of each feature that moves with the number of cells in the well, within a
 #   plate and column (DMSO wells are identical, so this is artifact; it produces the alternating-row pattern in column 2).
 # * **Position.** One *shared* additive row effect and column effect per feature, from the replicate-averaged compound wells
-#   of all layouts after the cell-count effect (medians, because values are heavy-tailed). DMSO wells (columns 2 and 24,
+#   of all layouts after the cell-count effect (medians, because values are heavy-tailed). DMSO wells (the control columns,
 #   where no compound sits) receive the row part of the map; their column level was set by step 4.
 # * **Amplitude per layout.** The position effect is not equally strong on every layout, so each layout gets the scale at
 #   which the shared map best fits its own compound wells (least squares), with a bootstrap standard error, shrunk toward
@@ -91,7 +148,7 @@ bulk_pipeline.run_pooled_bulk_processing(config)
 #
 # The plate's DMSO median and 1.4826 x MAD are taken from the *corrected* DMSO wells (for the base set, from the matched
 # ones), and every well is centred and scaled with them. The same constants are applied to single cells in
-# `4b.single_cell_correct`, so a well's bulk profile equals the median of its normalized cells.
+# `4b.single_cell_correct` (next PR), so a well's bulk profile equals the median of its normalized cells.
 #
 # ### Step 10: inverse normal transform (bulk profiles only)
 #

@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import bulk_pipeline as bp
 import bulk_utils as b
 from pycytominer import normalize
 
@@ -39,6 +40,47 @@ def test_check_plate_set_stops_on_missing_plate_unless_allowed():
         warnings.simplefilter("always")
         assert b.check_plate_set(["P1"], ["P1", "P2"], allow_partial=True) == ["P2"]
     assert any("ALLOW_PARTIAL" in str(w.message) for w in caught)
+
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+SCREEN_CONFIGS = [REPO / f"{s}_repo1_screen/3.process_features/screen_config.yaml" for s in ("CHP-134", "SK-N-AS")]
+
+
+def test_screen_configs_load_and_describe_a_384_well_layout():
+    for path in SCREEN_CONFIGS:
+        config = bp.load_config(path)
+        assert config.screen_name == path.parent.parent.name
+        assert (config.plate_rows, config.control_columns, config.outer_columns) == (16, (2, 24), (1, 2, 23, 24))
+        assert config.interior_columns == tuple(range(3, 23))
+        assert config.thresholds["correlation_threshold"] == 0.9
+
+
+def test_config_rejects_missing_unknown_and_non_consecutive_keys():
+    import yaml
+    raw = yaml.safe_load(SCREEN_CONFIGS[0].read_text())
+    for bad, message in [({k: v for k, v in raw.items() if k != "plate_rows"}, "missing keys ['plate_rows']"),
+                         ({**raw, "plate_colums": 24}, "unknown keys ['plate_colums']"),
+                         ({**raw, "interior_columns": [3, 4, 6]}, "consecutive"),
+                         ({**raw, "thresholds": {"min_abs_coef_var": 0.001}}, "thresholds must be exactly")]:
+        try:
+            bp.config_from_dict(bad)
+        except ValueError as error:
+            assert message in str(error), (message, str(error))
+        else:
+            raise AssertionError(f"accepted a bad configuration: {message}")
+
+
+def test_raw_profile_dir_is_the_first_candidate_that_exists():
+    import tempfile
+    import yaml
+    raw = yaml.safe_load(SCREEN_CONFIGS[1].read_text())
+    with tempfile.TemporaryDirectory() as tmp:
+        present = pathlib.Path(tmp) / "present"
+        present.mkdir()
+        config = bp.config_from_dict({**raw, "raw_profile_dirs": [str(pathlib.Path(tmp) / "absent"), str(present), str(REPO)]})
+        assert config.raw_profile_dir == present
+        config = bp.config_from_dict({**raw, "raw_profile_dirs": [str(pathlib.Path(tmp) / "absent"), str(pathlib.Path(tmp) / "absent2")]})
+        assert config.raw_profile_dir == pathlib.Path(tmp) / "absent"   # none exists: the first, which the error then names
 
 
 if __name__ == "__main__":

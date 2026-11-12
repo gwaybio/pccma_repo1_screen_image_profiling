@@ -1,9 +1,28 @@
 # Image-based profiling pipeline (CHP-134 and SK-N-AS), as implemented
 
 Starts from single cells that passed cell-level QC (coSMicQC). No plate filtering. Written from the code in
-`utils/bulk_pipeline.py`, `utils/bulk_utils.py`, `utils/single_cell_utils.py` and the notebooks `2`, `3`, `3a`, `3b`, `4b`, `5b`; each
-has a `nbconverted/*.py` twin that `run_pipeline.sh` calls (generated from `utils/_build/*_template.py`). Steps 2-3b are the
-same for every screen: the code is in `bulk_pipeline.py` and what differs between screens is in each screen's `screen_config.py`.
+`utils/bulk_pipeline.py`, `utils/bulk_utils.py`, `utils/single_cell_utils.py` and the notebooks `2.bulk_profiles`, `4b` and `5b`; each
+has a `nbconverted/*.py` twin that `run_pipeline.sh` calls (generated from `utils/_build/*_template.py`). The bulk steps (numbered
+2, 3, 3a and 3b below) are the four steps `annotate`, `aggregate`, `counts` and `pool` of the one notebook `2.bulk_profiles`, which
+is the same for every screen: the code is in `bulk_pipeline.py` and what differs between screens is in each screen's
+`screen_config.yaml` (next section).
+
+## Configuration: `screen_config.yaml`
+
+One file per screen, in its `3.process_features` folder, holds everything that differs between screens; `bulk_pipeline.load_config`
+reads it and rejects missing or unknown keys. It has five groups of keys:
+
+| Group | Keys |
+|---|---|
+| the screen | `screen_name` (prefixes every saved table), `profiles_dir` (the screen's folder on the mount; `PROFILES_DIR` overrides it) |
+| inputs | `raw_profile_dirs` (candidate folders; the first that exists is used), `raw_profile_suffix`, `platemap_dir`, `barcode_platemap_file`, `platemap_columns`, `platemap_rename`, `annotate_join_on`, `nuclei_location_columns` |
+| per-plate outputs | `qc_dir`, `annotated_dir`, `bulk_dir`, `annotated_subdir`, `annotated_glob`, `per_plate_glob` |
+| plate layout | `plate_rows`, `control_columns`, `interior_columns`, `outer_columns`, `empty_well_query`, `negative_control_query` |
+| thresholds | `min_abs_coef_var`, `correlation_threshold`, `min_control_wells`, `min_interior_wells`, `min_outer_wells` |
+
+A new screen needs a new `screen_config.yaml` (and the same notebook), not new code. The plate layout keys are what a screen with a
+different plate or control design changes. Settings that are not in the file (the cell-count winsorizing, bootstrap and backfitting
+counts, the frequency-filter cut-offs) are the parameters of the functions in `bulk_utils.py`, with the values listed below.
 
 Rule: **correct, then normalize, then (bulk only) rank-transform, then select features.** Corrections remove one named
 artifact each and are constants per well, so they apply identically to a well's median and to every cell in it.
@@ -36,10 +55,10 @@ Large files are written to local scratch, copied, and accepted only if a checksu
 | Order | Step | Per | Reads | Writes |
 |---|---|---|---|---|
 | 1 | `1.single_cell_qc` | plate | cells | QC flags |
-| 2 | `2.annotate` | plate | profiles, QC flags, platemap | `<plate>_annotated.parquet` (poor-quality cells dropped) |
-| 3 | `3.aggregate_bulk_profiles` | plate | annotated cells | `<plate>_bulk_aggregated.parquet` |
-| 3a | `3a.well_cell_counts` | screen | annotated cells (plate, well columns) | counts csv |
-| 3b | `3b.pooled_bulk_processing` | screen | per-plate aggregates, counts, platemap files | bulk profiles (corrected, base), correction tables |
+| 2 | `2.bulk_profiles` `STEPS=annotate` | plate | profiles, QC flags, platemap | `<plate>_annotated.parquet` (poor-quality cells dropped) |
+| 3 | `2.bulk_profiles` `STEPS=aggregate` | plate | annotated cells | `<plate>_bulk_aggregated.parquet` |
+| 3a | `2.bulk_profiles` `STEPS=counts` | screen | annotated cells (plate, well columns) | counts csv |
+| 3b | `2.bulk_profiles` `STEPS=pool` | screen | per-plate aggregates, counts, platemap files | bulk profiles (corrected, base), correction tables |
 | 4b-stats | `4b.single_cell_correct` `STAGE=stats` | plate | annotated cells (all variant features), tables | statistics pickle (no cells) |
 | 5b | `5b.single_cell_feature_select` | screen | all plates' statistics | selected-features JSON |
 | 4b-apply | `4b.single_cell_correct` `STAGE=apply` | plate | annotated cells (selected features), tables, list | corrected single cells |
@@ -54,15 +73,15 @@ filter; the corrections and the control-based variant filter have no pycytominer
 |---|---|---|---|
 | 1 | Pool; drop empty wells; read layouts (`pool_plate_profiles`, `drop_wells`, `layouts_from_platemaps`) | empty = no compound and no solvent | wells x features; layout per plate |
 | 2 | Drop non-finite features | NaN/inf in any well | `original` values kept |
-| 3 | E3a align DMSO columns (`align_control_columns`) | columns 2, 24; at least 5 controls per column per plate; rank-preserving map onto the plate's pooled controls | aligned values |
-| 4 | E3 match to interior (`match_outer_columns`) | per layout; baseline = layout's compound wells in columns 3-22; outer columns 1, 2, 23, 24; at least 20 interior, 5 outer wells | matched values; `shift = matched - original` |
-| 5 | Variant filter (`plate_control_stats`, `variant_features`) | control MAD not 0 and abs(MAD/median) > 1e-3 on every plate | variant features |
+| 3 | E3a align DMSO columns (`align_control_columns`) | `control_columns` (2, 24); at least `min_control_wells` (5) controls per column per plate; rank-preserving map onto the plate's pooled controls | aligned values |
+| 4 | E3 match to interior (`match_outer_columns`) | per layout; baseline = layout's compound wells in `interior_columns` (3-22); `outer_columns` (1, 2, 23, 24); at least `min_interior_wells` (20) interior, `min_outer_wells` (5) outer wells | matched values; `shift = matched - original` |
+| 5 | Variant filter (`plate_control_stats`, `variant_features`) | control MAD not 0 and abs(MAD/median) > `min_abs_coef_var` (1e-3) on every plate | variant features |
 | 6 | Provisional scale (`plate_scale`, `apply_plate_scale`) | per plate: (x - control median) / (1.4826 x control MAD) | values for step 7 only |
 | 7 | Effects (`estimate_effects`) | below | `density`, `position`, amplitudes |
 | 8 | Subtract effects, original units | `effects = (density + position) x provisional plate scale` | corrected values |
 | 9 | Normalize | per plate: (x - median) / (1.4826 x MAD) of the **corrected** controls | normalized wells; final plate scale |
 | 10 | Inverse normal transform (`inverse_normal_transform`) | pycytominer `inverse_normal`, all wells, seed 0 | transformed wells |
-| 11 | Feature selection (`select_features`) | frequency (freq_cut 0.05, unique_cut 0.01), correlation 0.9, blocklist, drop NaN | bulk profiles |
+| 11 | Feature selection (`select_features`) | frequency (freq_cut 0.05, unique_cut 0.01), correlation `correlation_threshold` (0.9), blocklist, drop NaN | bulk profiles |
 
 The base set skips steps 7-8.
 

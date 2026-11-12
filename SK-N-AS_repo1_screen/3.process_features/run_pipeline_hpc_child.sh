@@ -41,23 +41,23 @@ else
 fi
 
 # Step 2: annotation
-PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/2.annotate.py
+STEPS=annotate PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/2.bulk_profiles.py
 if [ $? -ne 0 ]; then
     echo "Annotation FAILED for plate: $plate_id"
     failed_steps+=("annotate")
 fi
 
 # Step 3: aggregation (per-plate only -- the whole-screen steps that follow,
-# 3a.well_cell_counts.ipynb and 3b.pooled_bulk_processing.ipynb, are not run here; run
+# the counts and pool steps of 2.bulk_profiles.ipynb, are not run here; run
 # them once every plate's aggregated profile is in)
-PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/3.aggregate_bulk_profiles.py
+STEPS=aggregate PLATE_ID="$plate_id" OVERWRITE="$overwrite" python nbconverted/2.bulk_profiles.py
 if [ $? -ne 0 ]; then
     echo "Aggregation FAILED for plate: $plate_id"
     failed_steps+=("aggregate")
 fi
 
-# Steps after this need the whole-screen tables from 3a.well_cell_counts and 3b.pooled_bulk_processing, so they are
-# not run here. Once every plate's aggregate is in, run 3a and 3b once, then submit
+# Steps after this need the whole-screen tables from the counts and pool steps (STEPS=counts, then STEPS=pool), so they are
+# not run here. Once every plate's aggregate is in, run those two once, then submit
 # run_single_cell_hpc_child.sh per plate with STAGE=stats, run 5b.single_cell_feature_select once, and submit it
 # again per plate with STAGE=apply.
 

@@ -1996,6 +1996,7 @@ dependencies = [
     { name = "papermill" },
     { name = "pyarrow" },
     { name = "pycytominer" },
+    { name = "pyyaml" },
     { name = "scikit-learn" },
     { name = "scipy" },
 ]
@@ -2031,6 +2032,7 @@ requires-dist = [
     { name = "papermill", specifier = ">=2.6" },
     { name = "pyarrow", specifier = "==20.0.0" },
     { name = "pycytominer", specifier = "==1.7.1" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "scikit-learn", specifier = "==1.7.2" },
     { name = "scipy", specifier = ">=1.16.1" },
 ]

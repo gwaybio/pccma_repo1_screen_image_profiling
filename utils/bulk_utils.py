@@ -417,6 +417,7 @@ def estimate_effects(
     n_backfit_iter: int = 6,
     n_boot: int = 200,
     seed: int = 0,
+    n_rows: int = PLATE_ROWS,
 ) -> tuple[np.ndarray, np.ndarray, pd.Series, pd.DataFrame]:
     """The cell-count (density) effect and the plate-position effect on every well, in the units of ``profiles``.
 
@@ -455,7 +456,7 @@ def estimate_effects(
     is_ctrl_col = is_control & np.isin(col, list(control_columns))
     logn = np.asarray(log_cell_count, dtype=float)
     has_n = np.isfinite(logn)
-    n_rows, n_cols = PLATE_ROWS, hi_c - lo_c + 1
+    n_cols = hi_c - lo_c + 1
 
     # density covariates: compound wells plate-centred and winsorized, control wells centred within plate x column
     z_comp = np.zeros(n)

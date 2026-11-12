@@ -19,8 +19,8 @@ jupyter nbconvert --to=script --FilesWriter.build_directory=nbconverted/ *.ipynb
 # PetaLibrary "koala" mount on Alpine, but fall back to the relative
 # data/converted_profiles directory in this repo checkout on scratch, in
 # case a plate hasn't been synced to koala yet. Must match the
-# Alpine-detection branch in 1.single_cell_qc.ipynb through
-# 3.aggregate_bulk_profiles.ipynb.
+# Alpine-detection branch in 1.single_cell_qc.ipynb and with raw_profile_dirs in
+# screen_config.yaml (used by 2.bulk_profiles.ipynb).
 koala_dir="/pl/active/koala/ALSF_screen_data/SK-N-AS_repo1_profiles/converted_profiles"
 scratch_dir="data/converted_profiles"
 if [ -d "$koala_dir" ]; then

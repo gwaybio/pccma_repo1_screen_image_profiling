@@ -13,7 +13,8 @@ dependencies = [
     "scikit-learn==1.7.2",
     "pyarrow==20.0.0",
     "openpyxl>=3.1",
-    # notebooks (generated from utils/_build templates) and papermill-driven QC
+    "pyyaml>=6",   # each screen's screen_config.yaml
+    # notebooks (generated from utils/_build templates by make_notebooks.py) and papermill-driven QC
     "nbformat>=5.10",
     "nbconvert>=7.16",
     "papermill>=2.6",

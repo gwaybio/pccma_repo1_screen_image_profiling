@@ -1,12 +1,13 @@
 """Bulk-profile processing steps shared by every screen.
 
-A screen is described once, by a `ScreenConfig` (each screen's `screen_config.py`). The notebooks only load that
-configuration and call one function from here, so a new screen needs a configuration, not new processing code:
+A screen is described once, in its `screen_config.yaml` (loaded by `load_config` into a `ScreenConfig`): paths, platemap
+columns, the plate layout (which columns hold the controls and the compounds) and the thresholds. The notebook
+`2.bulk_profiles` loads that file and calls the four steps below, so a new screen needs a YAML file, not new code:
 
-    annotate_plates(config)             2.annotate                  per plate: platemap and QC flags attached, poor-quality cells dropped
-    aggregate_plates(config)            3.aggregate_bulk_profiles   per plate: the median of the cells in each well
-    count_cells_per_well(config)        3a.well_cell_counts         whole screen: cells per well (the cell-count covariate)
-    run_pooled_bulk_processing(config)  3b.pooled_bulk_processing   whole screen: corrections, normalization, selection (see bulk_utils)
+    annotate_plates(config)             annotate   per plate: platemap and QC flags attached, poor-quality cells dropped
+    aggregate_plates(config)            aggregate  per plate: the median of the cells in each well
+    count_cells_per_well(config)        counts     whole screen: cells per well (the cell-count covariate)
+    run_pooled_bulk_processing(config)  pool       whole screen: corrections, normalization, selection (see bulk_utils)
 
 The per-plate steps read PLATE_ID (process one plate per run, which keeps memory down) and OVERWRITE from the environment.
 """
@@ -17,12 +18,13 @@ import json
 import os
 import pathlib
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+import yaml
 from pycytominer import aggregate, annotate
 from pycytominer.cyto_utils import output
 from pycytominer.cyto_utils.features import infer_cp_features
@@ -32,37 +34,88 @@ import bulk_utils
 PLATE_COLUMN = "Metadata_Plate"
 WELL_COLUMN = "Metadata_Well"
 PLATE_METADATA_PREFIX = "Metadata_"
-# Empty wells (no compound and no solvent) are dropped when pooling; wells with no compound that received DMSO are the negative controls
-UNTREATED_QUERY = "Metadata_Batch_Id.isna() and Metadata_Solvent.isna()"
-NEG_CONTROL_QUERY = 'Metadata_Batch_Id.isna() and Metadata_Solvent == "DMSO"'
 
 
 @dataclass(frozen=True)
 class ScreenConfig:
-    """Everything that differs between screens. Paths are relative to the screen's `3.process_features` folder."""
+    """Everything that differs between screens, read from the screen's `screen_config.yaml` (see `load_config`).
 
+    Every field is required: the YAML file is the one place a screen is described. Relative paths are relative to the
+    screen's `3.process_features` folder, where the notebook runs.
+    """
+
+    # the screen
     screen_name: str                      # e.g. "CHP-134_repo1_screen"; prefixes every saved table
-    profiles_dir: str                     # the screen's profiles folder on bandicoot (PROFILES_DIR overrides): 3a and 3b read and write here
-    raw_profile_dir: pathlib.Path         # one profile per plate before QC (the converted or merged profiles)
+    profiles_dir: str                     # the screen's profiles folder on bandicoot (PROFILES_DIR overrides): counts and pool read and write here
+    # inputs
+    raw_profile_dirs: tuple               # folders that may hold one profile per plate before QC; the first that exists is used
     raw_profile_suffix: str               # what follows the plate id in those file names: "_converted.parquet" or ".parquet"
-    platemap_columns: tuple               # barcode_platemap.csv columns: (plate barcode, platemap file name)
+    platemap_dir: pathlib.Path            # holds the barcode-to-platemap file and the platemap files
+    barcode_platemap_file: str            # one row per plate: its barcode and the name of its platemap file
+    platemap_columns: tuple               # the barcode_platemap_file columns: (plate barcode, platemap file name)
     platemap_rename: dict                 # renames applied to every platemap before annotation
     annotate_join_on: tuple               # (platemap column, profile column) joined by pycytominer.annotate
     nuclei_location_columns: tuple        # the two nuclei-centre columns as they are named in this screen's annotated profiles
-    qc_dir: pathlib.Path = pathlib.Path("./data/qc_results")
-    annotated_dir: pathlib.Path = pathlib.Path("./data/annotated_profiles")     # written by 2.annotate
-    bulk_dir: pathlib.Path = pathlib.Path("./data/bulk_profiles")               # per-plate aggregates, written by 3.aggregate_bulk_profiles
-    platemap_dir: pathlib.Path = pathlib.Path("../0.download_data/metadata")
-    annotated_subdir: str = "annotated_profiles"      # under profiles_dir: where 3a looks for the annotated profiles
-    annotated_glob: str = "*_annotated.parquet"
-    per_plate_glob: str = "*_bulk_aggregated.parquet"  # the per-plate aggregates that 3b pools
-    thresholds: dict = field(default_factory=lambda: {"min_abs_coef_var": 1e-3, "correlation_threshold": 0.9})
+    # outputs of the per-plate steps, and the file patterns the whole-screen steps read them back with
+    qc_dir: pathlib.Path                  # read: the per-cell QC flags of 1.single_cell_qc
+    annotated_dir: pathlib.Path           # written by annotate
+    bulk_dir: pathlib.Path                # per-plate aggregates, written by aggregate
+    annotated_subdir: str                 # under profiles_dir: where counts looks for the annotated profiles
+    annotated_glob: str
+    per_plate_glob: str                   # the per-plate aggregates that pool reads
+    # the plate layout
+    plate_rows: int                       # rows of the plate (16 for a 384-well plate, 8 for a 96-well plate)
+    control_columns: tuple                # columns that hold the negative controls (and no compounds)
+    interior_columns: tuple               # columns that hold compounds; their wells are the baseline for the control columns
+    outer_columns: tuple                  # columns matched to the interior ones (the control columns and the empty edge columns)
+    empty_well_query: str                 # pandas query: wells with neither compound nor solvent, dropped when pooling
+    negative_control_query: str           # pandas query: the negative-control wells every plate is normalized on
+    thresholds: dict                      # min_abs_coef_var, correlation_threshold, min_control_wells, min_interior_wells, min_outer_wells
+
+    @property
+    def raw_profile_dir(self) -> pathlib.Path:
+        """The first of `raw_profile_dirs` that exists (else the first, so the error names a real candidate)."""
+        candidates = [pathlib.Path(d).expanduser() for d in self.raw_profile_dirs]
+        return next((d for d in candidates if d.exists()), candidates[0])
+
+
+_PATH_FIELDS = ("platemap_dir", "qc_dir", "annotated_dir", "bulk_dir")
+_TUPLE_FIELDS = ("raw_profile_dirs", "platemap_columns", "annotate_join_on", "nuclei_location_columns",
+                 "control_columns", "interior_columns", "outer_columns")
+_THRESHOLDS = ("min_abs_coef_var", "correlation_threshold", "min_control_wells", "min_interior_wells", "min_outer_wells")
+
+
+def config_from_dict(raw: dict) -> ScreenConfig:
+    """Check a screen's configuration (every field present, none unknown) and build the `ScreenConfig`."""
+    names = [f.name for f in fields(ScreenConfig)]
+    missing, unknown = [n for n in names if n not in raw], [k for k in raw if k not in names]
+    if missing or unknown:
+        raise ValueError(f"screen configuration: missing keys {missing}, unknown keys {unknown}")
+    values = dict(raw)
+    for name in _PATH_FIELDS:
+        values[name] = pathlib.Path(values[name])
+    for name in _TUPLE_FIELDS:
+        values[name] = tuple(values[name])
+    values["raw_profile_dirs"] = tuple(pathlib.Path(d) for d in values["raw_profile_dirs"])
+    if not values["raw_profile_dirs"]:
+        raise ValueError("screen configuration: raw_profile_dirs is empty")
+    if set(values["thresholds"]) != set(_THRESHOLDS):
+        raise ValueError(f"screen configuration: thresholds must be exactly {list(_THRESHOLDS)}, got {sorted(values['thresholds'])}")
+    interior = values["interior_columns"]
+    if list(interior) != list(range(min(interior), max(interior) + 1)):
+        raise ValueError(f"screen configuration: interior_columns must be consecutive, got {list(interior)}")
+    return ScreenConfig(**values)
+
+
+def load_config(path: str | pathlib.Path) -> ScreenConfig:
+    """Read a screen's `screen_config.yaml`."""
+    return config_from_dict(yaml.safe_load(pathlib.Path(path).read_text()))
 
 
 def plate_names(config: ScreenConfig) -> list[str]:
     """The screen's plates, from the file names in the raw profile folder."""
     if not config.raw_profile_dir.exists():
-        raise FileNotFoundError(f"The raw profile folder {config.raw_profile_dir} does not exist.")
+        raise FileNotFoundError(f"None of the raw profile folders exists: {[str(d) for d in config.raw_profile_dirs]}")
     suffix = config.raw_profile_suffix
     return sorted(f.name.removesuffix(suffix) for f in config.raw_profile_dir.glob(f"*{suffix}"))
 
@@ -114,7 +167,7 @@ def _with_location_columns(df: pd.DataFrame, names: tuple) -> pd.DataFrame:
     return df.rename(columns=rename)
 
 
-# ---- per plate: 2.annotate ----
+# ---- per plate: annotate ----
 def annotate_plate(config: ScreenConfig, plate_id: str, barcode_platemap: pd.DataFrame, overwrite: bool = False) -> float | None:
     """Attach the platemap, drop the poor-quality segmentations (the QC flags) and write one annotated profile for the plate.
 
@@ -127,7 +180,7 @@ def annotate_plate(config: ScreenConfig, plate_id: str, barcode_platemap: pd.Dat
         return None
     platemap_path = _platemap_path(config, barcode_platemap, plate_id)
     if platemap_path is None:
-        print(f"Skipping {plate_id}: no platemap found in barcode_platemap.csv")
+        print(f"Skipping {plate_id}: no platemap found in the barcode-to-platemap file")
         return None
     output_file = config.annotated_dir / f"{plate_id}_annotated.parquet"
     if output_file.exists() and not overwrite:
@@ -167,9 +220,9 @@ def annotate_plate(config: ScreenConfig, plate_id: str, barcode_platemap: pd.Dat
 
 
 def annotate_plates(config: ScreenConfig) -> None:
-    """2.annotate: annotate every plate (or only $PLATE_ID), one after the other."""
+    """annotate: annotate every plate (or only $PLATE_ID), one after the other."""
     plates, overwrite = _plates_to_run(config)
-    barcode_platemap = pd.read_csv(pathlib.Path(config.platemap_dir) / "barcode_platemap.csv")
+    barcode_platemap = pd.read_csv(pathlib.Path(config.platemap_dir) / config.barcode_platemap_file)
     barcode_platemap[config.platemap_columns[0]] = barcode_platemap[config.platemap_columns[0]].str.replace(" ", "_", regex=False)
     config.annotated_dir.mkdir(parents=True, exist_ok=True)
     for plate_id in plates:
@@ -179,12 +232,12 @@ def annotate_plates(config: ScreenConfig) -> None:
                         [plate_id, f"{seconds:.1f}", datetime.now(timezone.utc).isoformat(timespec="seconds")])
 
 
-# ---- per plate: 3.aggregate_bulk_profiles ----
+# ---- per plate: aggregate ----
 def aggregate_plate(config: ScreenConfig, plate_id: str, overwrite: bool = False) -> float | None:
     """The median of the plate's cells in every well, with the platemap metadata that is constant within a well kept."""
     annotated_path = config.annotated_dir / f"{plate_id}_annotated.parquet"
     if not annotated_path.exists():
-        print(f"Skipping {plate_id}: not yet annotated (run 2.annotate.ipynb for this plate first)")
+        print(f"Skipping {plate_id}: not yet annotated (run the annotate step of 2.bulk_profiles.ipynb for this plate first)")
         return None
     output_file = config.bulk_dir / f"{plate_id}_bulk_aggregated.parquet"
     if output_file.exists() and not overwrite:
@@ -213,7 +266,7 @@ def aggregate_plate(config: ScreenConfig, plate_id: str, overwrite: bool = False
 
 
 def aggregate_plates(config: ScreenConfig) -> None:
-    """3.aggregate_bulk_profiles: aggregate every plate (or only $PLATE_ID)."""
+    """aggregate: aggregate every plate (or only $PLATE_ID)."""
     plates, overwrite = _plates_to_run(config)
     config.bulk_dir.mkdir(parents=True, exist_ok=True)
     for plate_id in plates:
@@ -223,7 +276,7 @@ def aggregate_plates(config: ScreenConfig) -> None:
                         [plate_id, f"{seconds:.1f}", datetime.now(timezone.utc).isoformat(timespec="seconds")])
 
 
-# ---- whole screen: 3a.well_cell_counts ----
+# ---- whole screen: counts ----
 def count_cells_per_well(config: ScreenConfig) -> pathlib.Path:
     """Count the quality-controlled cells of every well from the annotated profiles (only the plate and well columns are read).
 
@@ -263,7 +316,7 @@ def count_cells_per_well(config: ScreenConfig) -> pathlib.Path:
     return output_file
 
 
-# ---- whole screen: 3b.pooled_bulk_processing ----
+# ---- whole screen: pool ----
 def run_pooled_bulk_processing(config: ScreenConfig) -> None:
     """Pool the plates and run the corrections, normalization, rank transform and feature selection (see bulk_utils).
 
@@ -281,7 +334,9 @@ def run_pooled_bulk_processing(config: ScreenConfig) -> None:
     tables_dir = bulk_dir                                                                                      # correction tables
     min_abs_coef_var = config.thresholds["min_abs_coef_var"]
     correlation_threshold = config.thresholds["correlation_threshold"]
-    barcode_platemap_file = pathlib.Path(config.platemap_dir) / "barcode_platemap.csv"
+    neg_control_query = config.negative_control_query
+    interior = config.interior_columns
+    barcode_platemap_file = pathlib.Path(config.platemap_dir) / config.barcode_platemap_file
 
     aggregate_dir = _input_dir("BULK_PROFILES_DIR", config.bulk_dir, bulk_dir, config.per_plate_glob)
     plate_files = sorted(aggregate_dir.glob(config.per_plate_glob))
@@ -290,7 +345,7 @@ def run_pooled_bulk_processing(config: ScreenConfig) -> None:
     print(f"Reading {len(plate_files)} per-plate profiles from {plate_files[0].parent}")
 
     def report(step, profiles, features):
-        n_controls = int(bulk_utils.control_mask(profiles, NEG_CONTROL_QUERY).sum())
+        n_controls = int(bulk_utils.control_mask(profiles, neg_control_query).sum())
         print(f"{step}: {len(profiles)} wells ({n_controls} controls) on {profiles[PLATE_COLUMN].nunique()} plates, {len(features)} features")
 
     def with_values(frame, features, values):
@@ -307,7 +362,7 @@ def run_pooled_bulk_processing(config: ScreenConfig) -> None:
     pooled = bulk_utils.pool_plate_profiles(plate_files, PLATE_COLUMN)
     # every plate the platemap file lists must be here (ALLOW_PARTIAL=1 overrides, for a deliberate run on some plates)
     bulk_utils.check_plate_set(pooled[PLATE_COLUMN].unique(), layout_by_plate.index, allow_partial=bool(os.environ.get("ALLOW_PARTIAL")))
-    pooled, n_untreated = bulk_utils.drop_wells(pooled, UNTREATED_QUERY)
+    pooled, n_untreated = bulk_utils.drop_wells(pooled, config.empty_well_query)
     print(f"dropped {n_untreated} empty wells (no compound, no solvent)")
     assert not pooled.duplicated([PLATE_COLUMN, WELL_COLUMN]).any(), "a plate/well appears more than once"
     features = infer_cp_features(pooled)
@@ -325,15 +380,19 @@ def run_pooled_bulk_processing(config: ScreenConfig) -> None:
     original = pooled[features].to_numpy(dtype=float).copy()   # values before any correction (for the per-well shift)
 
     # steps 3-4: line up the two DMSO columns (E3a), then match the DMSO columns to the interior compound wells (E3)
-    pooled = bulk_utils.align_control_columns(pooled, features, NEG_CONTROL_QUERY, PLATE_COLUMN, WELL_COLUMN)
+    pooled = bulk_utils.align_control_columns(pooled, features, neg_control_query, PLATE_COLUMN, WELL_COLUMN,
+                                              columns=config.control_columns, min_wells=config.thresholds["min_control_wells"])
     report("3 control columns aligned", pooled, features)
-    pooled = bulk_utils.match_outer_columns(pooled, features, PLATE_COLUMN, WELL_COLUMN, layout=layout)
+    pooled = bulk_utils.match_outer_columns(pooled, features, PLATE_COLUMN, WELL_COLUMN, layout=layout,
+                                             interior_columns=interior, outer_columns=config.outer_columns,
+                                             min_interior_wells=config.thresholds["min_interior_wells"],
+                                             min_outer_wells=config.thresholds["min_outer_wells"])
     shift = pooled[features].to_numpy(dtype=float) - original   # what steps 3-4 added to each well's median
     report("4 matched to interior", pooled, features)
     print(f"wells changed by steps 3-4: {int((np.abs(shift).sum(axis=1) > 0).sum())}")
 
     # step 5: variant filter
-    is_control = bulk_utils.control_mask(pooled, NEG_CONTROL_QUERY)
+    is_control = bulk_utils.control_mask(pooled, neg_control_query)
     stats = bulk_utils.plate_control_stats(pooled, features, is_control, PLATE_COLUMN)
     features_kept, features_dropped = bulk_utils.variant_features(stats, min_abs_coef_var)
     print(f"dropped {len(features_dropped)} of {len(features)} features that do not vary in the DMSO wells of every plate")
@@ -345,7 +404,7 @@ def run_pooled_bulk_processing(config: ScreenConfig) -> None:
 
     # step 6: provisional scaling (to estimate the effects on a common scale)
     matched = pooled[features].to_numpy(dtype=float)
-    provisional_scale = bulk_utils.plate_scale(pooled, features, NEG_CONTROL_QUERY, PLATE_COLUMN)
+    provisional_scale = bulk_utils.plate_scale(pooled, features, neg_control_query, PLATE_COLUMN)
     provisional = bulk_utils.apply_plate_scale(matched, pooled[PLATE_COLUMN].to_numpy(), provisional_scale, features, PLATE_COLUMN)
     assert np.isfinite(provisional).all(), "non-finite values after provisional scaling"
 
@@ -359,7 +418,8 @@ def run_pooled_bulk_processing(config: ScreenConfig) -> None:
     assert np.isfinite(n_cells).mean() > 0.99, "cell counts missing for more than 1% of wells"
     log_n = np.log(np.where(n_cells > 0, n_cells, np.nan))
     density, position, layout, amplitudes = bulk_utils.estimate_effects(
-        with_values(pooled, features, provisional), features, log_n, NEG_CONTROL_QUERY, PLATE_COLUMN, WELL_COLUMN, layout=layout,
+        with_values(pooled, features, provisional), features, log_n, neg_control_query, PLATE_COLUMN, WELL_COLUMN, layout=layout,
+        compound_columns=(min(interior), max(interior)), control_columns=config.control_columns, n_rows=config.plate_rows,
     )
     print(amplitudes.round(3).to_string(index=False))
     print(f"layouts: {layout.nunique()}; wells with a density effect: {int((np.abs(density).sum(axis=1) > 0).sum())}; "
@@ -373,7 +433,7 @@ def run_pooled_bulk_processing(config: ScreenConfig) -> None:
     print(f"median |effect| / plate scale: {np.median(np.abs(density + position)):.4f}")
 
     # step 9: normalize each plate on its (corrected) DMSO wells
-    final_scale = bulk_utils.plate_scale(with_values(pooled, features, corrected), features, NEG_CONTROL_QUERY, PLATE_COLUMN)
+    final_scale = bulk_utils.plate_scale(with_values(pooled, features, corrected), features, neg_control_query, PLATE_COLUMN)
     base_scale = provisional_scale
     plates = pooled[PLATE_COLUMN].to_numpy()
     normalized = bulk_utils.apply_plate_scale(corrected, plates, final_scale, features, PLATE_COLUMN)
@@ -407,7 +467,7 @@ def run_pooled_bulk_processing(config: ScreenConfig) -> None:
         "selected_bulk_corrected": selected_features,
         "selected_bulk_base": base_selected_features,
         "plate_layout": layout_by_plate.to_dict(),
-        "control_query": NEG_CONTROL_QUERY,
+        "control_query": neg_control_query,
     }, indent=1))
     amplitudes.to_csv(tables_dir / f"{screen_name}_correction_layout_amplitudes.csv", index=False)
     print(f"saved correction tables to {tables_dir}")
